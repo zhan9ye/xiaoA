@@ -1,0 +1,39 @@
+# 密钥与本地配置（服务器上单独创建）
+backend/.env
+.env
+.env.local
+.env.*.local
+
+# Python
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# SQLite 与运行时数据
+backend/data/*.db
+backend/data/*.db-journal
+backend/data/*.db-wal
+backend/data/*.db-shm
+
+# 日志
+backend/logs/*.log
+
+# Node / 前端（任意目录下的依赖目录均忽略）
+node_modules/
+frontend/dist/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
