@@ -48,5 +48,9 @@ class Settings(BaseSettings):
     # True：池已满无法分配时拒绝（503）；False：回退为不使用代理直连。
     proxy_pool_require_available: bool = True  # PROXY_POOL_REQUIRE_AVAILABLE
 
+    # 出站 httpx 是否校验 HTTPS 证书链（连接 akapi1 等 RPC）。默认 True。
+    # 若对端证书链不完整导致 [SSL: CERTIFICATE_VERIFY_FAILED]，可先设 false 权宜（存在中间人风险）。
+    outbound_tls_verify: bool = True  # OUTBOUND_TLS_VERIFY
+
 
 settings = Settings()

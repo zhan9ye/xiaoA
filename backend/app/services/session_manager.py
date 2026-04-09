@@ -42,7 +42,7 @@ class SessionManager:
                 kw: dict = {
                     "timeout": 30.0,
                     "follow_redirects": True,
-                    "verify": _outbound_verify_ca_bundle(),
+                    "verify": _outbound_verify_ca_bundle() if settings.outbound_tls_verify else False,
                 }
                 if self._proxy_url:
                     kw["proxy"] = self._proxy_url
