@@ -161,13 +161,16 @@ class AppConfigIn(BaseModel):
 
 class AppConfigOut(BaseModel):
     username: str
+    password: str = Field(
+        default="",
+        description="交易端密码明文（与 key_token 一致由接口回显，便于核对；请勿在不可信环境截屏外传）",
+    )
     key_token: str
     mnemonic: str
     quantity_start_limit: int
     request_interval_ms: int
     run_period_start: str
     run_period_end: str
-    has_password: bool
     sell_start_time: str = ""
     listing_amounts: Dict[str, str] = Field(
         default_factory=dict,

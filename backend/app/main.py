@@ -78,6 +78,15 @@ from app.trading_config_repo import ensure_trading_config_loaded, load_trading_c
 from app.user_registry import get_or_create_log_hub, get_or_create_state, shutdown_all
 
 
+def _trading_password_for_api(pw: str) -> str:
+    """与 key_token 一样明文回显；库内空密码在内存中用单空格占位，不把占位符返回前端。"""
+    if not pw:
+        return ""
+    if pw == " ":
+        return ""
+    return pw
+
+
 async def _resume_runner_tasks() -> None:
     """进程启动后恢复 runner_enabled=true 的任务。"""
     from sqlalchemy import select
@@ -273,13 +282,13 @@ async def save_config(
     c = st.config
     return AppConfigOut(
         username=c.username,
+        password=_trading_password_for_api(c.password),
         key_token=c.key_token,
         mnemonic=c.mnemonic,
         quantity_start_limit=c.quantity_start_limit,
         request_interval_ms=c.request_interval_ms,
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
-        has_password=bool(c.password),
         sell_start_time=c.sell_start_time or "",
         listing_amounts=listing_amounts_for_api(c),
     )
@@ -294,13 +303,13 @@ async def get_config(user: User = Depends(require_active_subscription), db: Asyn
     c = st.config
     return AppConfigOut(
         username=c.username,
+        password=_trading_password_for_api(c.password),
         key_token=c.key_token,
         mnemonic=c.mnemonic,
         quantity_start_limit=c.quantity_start_limit,
         request_interval_ms=c.request_interval_ms,
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
-        has_password=bool(c.password),
         sell_start_time=c.sell_start_time or "",
         listing_amounts=listing_amounts_for_api(c),
     )

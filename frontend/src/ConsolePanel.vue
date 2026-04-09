@@ -493,35 +493,6 @@ const displayedSubaccounts = computed(() => {
   });
 });
 
-function tradeCredStorageKey() {
-  if (platformUserId.value == null) return null;
-  return `xiaoA_trade_terminal_${platformUserId.value}`;
-}
-
-function readTradeCredsFromStorage() {
-  const k = tradeCredStorageKey();
-  if (!k || typeof localStorage === "undefined") return null;
-  try {
-    const raw = localStorage.getItem(k);
-    if (!raw) return null;
-    const o = JSON.parse(raw);
-    return {
-      username: (o.username && String(o.username).trim()) || "",
-      password: typeof o.password === "string" ? o.password : "",
-    };
-  } catch (_) {
-    return null;
-  }
-}
-
-/** 下次打开网页时自动填入：从本机读取交易用户名 + 密码（按平台账号隔离） */
-function applyTradeCredsFromStorageFull() {
-  const ls = readTradeCredsFromStorage();
-  if (!ls) return;
-  if (ls.username) tradeUser.value = ls.username;
-  if (ls.password) tradePassword.value = ls.password;
-}
-
 function splitMnemonicCsv(csv) {
   const parts = String(csv || "")
     .split(",")
@@ -546,20 +517,6 @@ function onMnemonicPartInput(index, e) {
     const next = document.getElementById(`mnemonic-part-${index + 1}`);
     if (next) next.focus();
   }
-}
-
-function persistTradeCredsToLocal() {
-  const k = tradeCredStorageKey();
-  if (!k || typeof localStorage === "undefined") return;
-  try {
-    localStorage.setItem(
-      k,
-      JSON.stringify({
-        username: tradeUser.value.trim(),
-        password: tradePassword.value,
-      })
-    );
-  } catch (_) {}
 }
 
 async function loadMe() {
@@ -718,6 +675,7 @@ async function loadConfig() {
     if (j && j.username) {
       const serverUser = String(j.username).trim();
       tradeUser.value = serverUser;
+      tradePassword.value = j.password != null ? String(j.password) : "";
       if (j.key_token != null) keyToken.value = j.key_token;
       mnemonicParts.value = splitMnemonicCsv(j.mnemonic || "");
       quantityStartLimit.value = j.quantity_start_limit ?? 1000;
@@ -730,16 +688,11 @@ async function loadConfig() {
       } else {
         listingAmountsMap.value = {};
       }
-      const ls = readTradeCredsFromStorage();
-      if (ls && ls.username === serverUser && ls.password) {
-        tradePassword.value = ls.password;
-      } else {
-        tradePassword.value = "";
-      }
     } else {
       mnemonicParts.value = Array.from({ length: MNEMONIC_SEGMENTS }, () => "");
       listingAmountsMap.value = {};
-      applyTradeCredsFromStorageFull();
+      tradeUser.value = "";
+      tradePassword.value = "";
     }
   } catch (_) {}
 }
@@ -849,7 +802,7 @@ async function saveConfig() {
     if (saved.listing_amounts && typeof saved.listing_amounts === "object") {
       listingAmountsMap.value = { ...saved.listing_amounts };
     }
-    persistTradeCredsToLocal();
+    if (saved.password != null) tradePassword.value = String(saved.password);
     saveMsg.value = "已保存";
     connectWs();
     await loadSubaccounts();
@@ -952,7 +905,6 @@ watch(
     logs.value = [];
     await loadMe();
     await loadCreditsOverview();
-    applyTradeCredsFromStorageFull();
     await loadConfig();
     await loadSubaccounts();
     connectWs();
@@ -963,7 +915,6 @@ watch(
 onMounted(async () => {
   await loadMe();
   await loadCreditsOverview();
-  applyTradeCredsFromStorageFull();
   await loadConfig();
   await loadSubaccounts();
   connectWs();
@@ -1064,15 +1015,14 @@ onBeforeUnmount(() => {
             v-model="tradeUser"
             class="mb-3 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
             autocomplete="username"
-            @blur="persistTradeCredsToLocal"
           />
-          <label class="mb-1 block text-xs text-zinc-500">交易密码</label>
+          <label class="mb-1 block text-xs text-zinc-500">交易密码（明文展示，与接口回显一致）</label>
           <input
             v-model="tradePassword"
-            type="password"
-            class="mb-1 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-            autocomplete="current-password"
-            @blur="persistTradeCredsToLocal"
+            type="text"
+            class="mb-1 w-full rounded-lg border border-line bg-black/40 px-3 py-2 font-mono text-sm outline-none ring-blue-500 focus:ring-2"
+            placeholder="与交易端登录密码一致；留空保存表示保留服务端已存密码"
+            autocomplete="off"
           />
           <label class="mb-1 block text-xs text-zinc-500">Google 共享密钥（16位大写字母或数字）</label>
           <input
