@@ -1,10 +1,21 @@
 import asyncio
+import os
 from typing import Optional
 
+import certifi
 import httpx
 
 from app.middleware_request_log import httpx_outbound_response_log_hook
 from app.settings import settings
+
+
+def _outbound_verify_ca_bundle() -> str:
+    """出站 HTTPS 校验使用的 CA 包路径。优先 SSL_CERT_FILE / REQUESTS_CA_BUNDLE，否则用 certifi 内置包，避免仅依赖系统 /usr/lib/ssl。"""
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        p = (os.environ.get(key) or "").strip()
+        if p and os.path.isfile(p):
+            return p
+    return certifi.where()
 
 
 def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
@@ -28,7 +39,11 @@ class SessionManager:
     async def client(self) -> httpx.AsyncClient:
         async with self._lock:
             if self._client is None:
-                kw: dict = {"timeout": 30.0, "follow_redirects": True}
+                kw: dict = {
+                    "timeout": 30.0,
+                    "follow_redirects": True,
+                    "verify": _outbound_verify_ca_bundle(),
+                }
                 if self._proxy_url:
                     kw["proxy"] = self._proxy_url
                 if settings.request_log_enabled and (settings.request_log_outbound_hosts or "").strip():
