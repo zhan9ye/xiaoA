@@ -38,7 +38,7 @@ async def get_or_create_session_manager(
             if prev == desired:
                 return cur
             await cur.close()
-        _managers[user_id] = SessionManager(proxy_url=desired)
+        _managers[user_id] = SessionManager(proxy_url=desired, platform_user_id=user_id)
         return _managers[user_id]
 
 

@@ -1,5 +1,6 @@
 """
 出站 HTTP（httpx）文件日志：仅当请求主机匹配配置列表（默认 akapi1.com，含 www.akapi1.com）时记录。
+每条带 platform_user_id（控制台用户）。请求体仍记录；响应体仅在失败时记录（HTTP 非 2xx 或 JSON Error=true），成功写 (omitted, success)。
 正文按长度截断；不做脱敏（日志文件可能含密码、token、助记词等，请限制文件权限并勿外传）。
 """
 
@@ -45,6 +46,25 @@ def _outbound_host_patterns() -> list[str]:
     return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
+def _should_log_response_body(status_code: int, resp_bytes: bytes) -> bool:
+    """
+    失败才落响应正文：HTTP 非 2xx，或 2xx 且 JSON 中 Error=true（上游业务失败）。
+    """
+    if not (200 <= int(status_code) < 300):
+        return True
+    raw = resp_bytes or b""
+    if not raw.strip():
+        return False
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("Error") is True:
+            return True
+    except (json.JSONDecodeError, TypeError, ValueError, UnicodeError):
+        pass
+    return False
+
+
 def outbound_host_matches(host: str) -> bool:
     """主机等于某配置项，或为 某配置项 的子域（如 api.ak2018.vip 匹配 ak2018.vip）。"""
     h = (host or "").lower()
@@ -79,7 +99,11 @@ def setup_request_file_logger() -> logging.Logger:
     return lg
 
 
-async def httpx_outbound_response_log_hook(response: httpx.Response) -> None:
+async def httpx_outbound_response_log_hook(
+    response: httpx.Response,
+    *,
+    platform_user_id: Optional[int] = None,
+) -> None:
     if not settings.request_log_enabled:
         return
     if not _outbound_host_patterns():
@@ -108,21 +132,29 @@ async def httpx_outbound_response_log_hook(response: httpx.Response) -> None:
     req_body = _format_body_for_log(req_bytes, max_body)
     resp_bytes = response.content or b""
     ct = response.headers.get("content-type", "") or ""
-    log_resp = _format_body_for_log(resp_bytes, max_body)
-    if len(log_resp) > 65536:
-        log_resp = log_resp[:65536] + "... [LINE_TRUNCATED]"
+    code = int(response.status_code)
+    log_fail = _should_log_response_body(code, resp_bytes)
+    if log_fail:
+        log_resp = _format_body_for_log(resp_bytes, max_body)
+        if len(log_resp) > 65536:
+            log_resp = log_resp[:65536] + "... [LINE_TRUNCATED]"
+    else:
+        log_resp = "(omitted, success)"
 
     try:
         url_str = str(req.url)
     except Exception:
         url_str = ""
 
+    who = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
+
     lg.info(
-        "OUTBOUND %s %s | req_body=%s\nRESPONSE status=%s content-type=%s | body=%s",
+        "%s | OUTBOUND %s %s | req_body=%s\nRESPONSE status=%s content-type=%s | body=%s",
+        who,
         req.method,
         url_str,
         req_body,
-        response.status_code,
+        code,
         ct,
         log_resp,
     )
