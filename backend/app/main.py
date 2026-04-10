@@ -592,7 +592,9 @@ async def refresh_subaccounts(
     sub_out = None
     if reuse_session:
         sub_out = await fetch_subs(rk, uid)
-        if not sub_out.first_page_ok and sub_out.first_page_status_code == 401:
+        if not sub_out.first_page_ok and (
+            sub_out.first_page_status_code == 401 or sub_out.not_logged_in
+        ):
             st.logged_in = False
             sub_out = None
         # 其它错误码仍返回已拿到的列表（可能为空），不强制重登

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -70,3 +71,45 @@ def today_prep_and_start(sell_hhmm: str) -> Optional[Tuple[dt.datetime, dt.datet
     n = max(1, int(getattr(settings, "sell_prep_seconds_before", 30) or 30))
     prep = start - dt.timedelta(seconds=n)
     return prep, start
+
+
+async def wait_interruptible_until_beijing(
+    stop_event: asyncio.Event,
+    deadline: dt.datetime,
+    *,
+    max_chunk_seconds: float = 0.25,
+) -> None:
+    """
+    墙钟对齐：睡到北京时间 >= deadline（分段 wait，避免单次长 sleep 与系统时间调整叠加后偏差过大）。
+    """
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=BJ)
+    while not stop_event.is_set():
+        now = beijing_now()
+        if now >= deadline:
+            return
+        rem = (deadline - now).total_seconds()
+        chunk = min(max(rem, 0.0), max_chunk_seconds)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=chunk)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def wait_open_phases_beijing(
+    stop_event: asyncio.Event,
+    start_dt: dt.datetime,
+    wake_early_ms: int,
+) -> None:
+    """
+    WaitOpen：先睡到 T_open - wake_early_ms（最后组装），再睡到 T_open 整点。
+    """
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=BJ)
+    w = max(0, int(wake_early_ms or 0))
+    if w > 0:
+        early = start_dt - dt.timedelta(milliseconds=w)
+        if beijing_now() < early:
+            await wait_interruptible_until_beijing(stop_event, early)
+    if beijing_now() < start_dt:
+        await wait_interruptible_until_beijing(stop_event, start_dt)

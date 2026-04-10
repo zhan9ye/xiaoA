@@ -32,10 +32,23 @@ class Settings(BaseSettings):
     runner_loop_interval_seconds: int = 10
     # 配置了 sell_start_time 时：开售整点（北京时间）之前多少秒开始登录并拉取子账号（全量更新内存缓存一次）
     sell_prep_seconds_before: int = 30
+    # 配置了 sell_start_time 时：仅当「北京时间 ≥ 开售时刻 + 本秒数」后，ACE_Sell_Son 返回「本日交易通道已關閉」才视为真收工。
+    # 避免上游晚 1～2 秒开门时，整点请求误把「尚未开放」当成通道已关。
+    sell_channel_closed_trust_after_seconds: int = 60
+    # 定时开售：准备阶段 Login+My_Subaccount 最大尝试次数（每次尝试均须在 T_open 前）
+    sell_prep_max_attempts: int = 8
+    sell_prep_retry_delay_seconds: float = 2.0
+    # WaitOpen：先睡到 T_open - 本毫秒数再睡到整点（最后组装）
+    sell_wait_open_wake_early_ms: int = 50
+    # 多实例互斥（需共用同一数据库）；单机可 false
+    runner_lease_enabled: bool = False
+    runner_lease_ttl_seconds: int = 45
+    # 留空则进程内随机 UUID；多机部署建议每机固定不同值（如 hostname）
+    runner_lease_holder_id: str = ""
 
     database_url: str = "sqlite+aiosqlite:///./data/app.db"
 
-    # 出站 httpx 请求文件日志（backend/logs/http_requests.log，敏感字段 JSON 内脱敏）
+    # 出站 httpx 请求文件日志（backend/logs/http_requests.log；不设脱敏，注意文件权限）
     request_log_enabled: bool = True
     request_log_dir: str = ""
     request_log_max_bytes: int = 10_485_760

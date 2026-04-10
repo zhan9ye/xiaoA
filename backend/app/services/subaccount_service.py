@@ -3,6 +3,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 
+from app.services.runner_fetch_guard import assert_sub_fetch_allowed
+from app.services.rpc_auth_signals import json_indicates_rpc_not_logged_in
 from app.services.rpc_common import get_rpc_browser_headers
 from app.services.session_manager import SessionManager
 from app.services.subaccount_parse import (
@@ -18,6 +20,8 @@ class FetchSubaccountsOutcome(NamedTuple):
     """首页 My_Subaccount 是否 2xx（未请求过首页时为 True）。"""
     first_page_ok: bool
     first_page_status_code: int
+    """HTTP 200 但 JSON 为未登录时 True，调用方应重新 Login。"""
+    not_logged_in: bool
 
 
 async def post_my_subaccount_json(
@@ -77,10 +81,12 @@ async def fetch_all_subaccounts(
     """
     自动翻页拉取全部子账号。log_push(level_name, msg) 用于日志；silent=True 时不输出子账号接口详情。
     """
+    assert_sub_fetch_allowed()
     all_norm: List[Dict[str, Any]] = []
     page = 1
     first_page_ok = True
     first_page_status_code = 0
+    not_logged_in = False
 
     async def _log(level_name: str, msg: str) -> None:
         if silent or log_push is None:
@@ -100,6 +106,16 @@ async def fetch_all_subaccounts(
         if page == 1:
             first_page_ok = ok
             first_page_status_code = int(code)
+            if ok and json_indicates_rpc_not_logged_in(parsed):
+                not_logged_in = True
+                first_page_ok = False
+                await _log("warn", "My_Subaccount 返回用戶未登錄，应重新 Login")
+                return FetchSubaccountsOutcome(
+                    [],
+                    first_page_ok,
+                    first_page_status_code,
+                    True,
+                )
         if not ok:
             await _log("error", f"My_Subaccount p={page} 失败 HTTP {code}")
             if not silent:
@@ -126,4 +142,4 @@ async def fetch_all_subaccounts(
             f"已达最大翻页数 {max_pages}，停止拉取（当前共 {len(all_norm)} 条）",
         )
 
-    return FetchSubaccountsOutcome(all_norm, first_page_ok, first_page_status_code)
+    return FetchSubaccountsOutcome(all_norm, first_page_ok, first_page_status_code, not_logged_in)

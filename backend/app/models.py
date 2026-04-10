@@ -59,6 +59,19 @@ class ProxyPoolEntry(Base):
     )
 
 
+class RunnerLease(Base):
+    """
+    分布式 runner 互斥：同一 user_id 在 expires_at 前仅 holder_id 匹配实例可卖。
+    单机 SQLite 可关 RUNNER_LEASE_ENABLED；多 ECS 共用 PostgreSQL 等时建议开启。
+    """
+
+    __tablename__ = "runner_leases"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    holder_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+
+
 class TradingConfig(Base):
     """交易端配置持久化（与平台用户一对一）。"""
 

@@ -1,49 +1,21 @@
 """
 出站 HTTP（httpx）文件日志：仅当请求主机匹配配置列表（默认 akapi1.com，含 www.akapi1.com）时记录。
-敏感字段（password、token、mnemonic 等）在 JSON 中替换为 ***。
+正文按长度截断；不做脱敏（日志文件可能含密码、token、助记词等，请限制文件权限并勿外传）。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
 from app.settings import settings
 
 _logger: Optional[logging.Logger] = None
-
-
-def _sensitive_key(name: str) -> bool:
-    k = name.lower()
-    for frag in (
-        "password",
-        "secret",
-        "token",
-        "mnemonic",
-        "key_token",
-        "authorization",
-        "g_code",
-        "gcode",
-        "rpc_login_key",
-        "key_enc",
-    ):
-        if frag in k:
-            return True
-    return False
-
-
-def _redact_json_obj(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {str(k): "***" if _sensitive_key(str(k)) else _redact_json_obj(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_redact_json_obj(x) for x in obj]
-    return obj
 
 
 def _format_body_for_log(raw: bytes, max_len: int) -> str:
@@ -60,23 +32,10 @@ def _format_body_for_log(raw: bytes, max_len: int) -> str:
     if not truncated:
         try:
             parsed = json.loads(text)
-            return json.dumps(_redact_json_obj(parsed), ensure_ascii=False) + note
+            return json.dumps(parsed, ensure_ascii=False) + note
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-    safe = text
-    safe = re.sub(
-        r'("password"\s*:\s*)"[^"]*"',
-        r'\1"***"',
-        safe,
-        flags=re.IGNORECASE,
-    )
-    safe = re.sub(
-        r'("key_token"\s*:\s*)"[^"]*"',
-        r'\1"***"',
-        safe,
-        flags=re.IGNORECASE,
-    )
-    return safe + note
+    return text + note
 
 
 def _outbound_host_patterns() -> list[str]:
