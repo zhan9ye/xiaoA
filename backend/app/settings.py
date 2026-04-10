@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # 配置了 sell_start_time 时：仅当「北京时间 ≥ 开售时刻 + 本秒数」后，ACE_Sell_Son 返回「本日交易通道已關閉」才视为真收工。
     # 避免上游晚 1～2 秒开门时，整点请求误把「尚未开放」当成通道已关。
     sell_channel_closed_trust_after_seconds: int = 60
+    # 停止后再开始、未登录后补拉子账号：最多尝试次数与间隔（毫秒）
+    sell_resume_sub_fetch_max_attempts: int = 6
+    sell_resume_sub_fetch_delay_ms: int = 500
     # 定时开售：准备阶段 Login+My_Subaccount 最大尝试次数（每次尝试均须在 T_open 前）
     sell_prep_max_attempts: int = 8
     sell_prep_retry_delay_seconds: float = 2.0

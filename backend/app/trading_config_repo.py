@@ -20,8 +20,8 @@ def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
     if not pw:
         pw = " "
     ri = int(row.request_interval_ms or 1000)
-    if ri < 1000:
-        ri = 1000
+    if ri < 500:
+        ri = 500
     return AppConfigIn.model_construct(
         username=(row.username or "").strip() or "user",
         password=pw,
@@ -67,7 +67,7 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
             rpc_user_id=cfg.rpc_user_id or "",
             rpc_version="",
             quantity_start_limit=cfg.quantity_start_limit,
-            request_interval_ms=max(1000, int(cfg.request_interval_ms or 1000)),
+            request_interval_ms=max(500, int(cfg.request_interval_ms or 1000)),
             run_period_start=cfg.run_period_start or "",
             run_period_end=cfg.run_period_end or "",
             runner_enabled=bool(cfg.runner_enabled),
@@ -85,7 +85,7 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
         row.rpc_user_id = cfg.rpc_user_id or ""
         row.rpc_version = ""
         row.quantity_start_limit = cfg.quantity_start_limit
-        row.request_interval_ms = max(1000, int(cfg.request_interval_ms or 1000))
+        row.request_interval_ms = max(500, int(cfg.request_interval_ms or 1000))
         row.run_period_start = cfg.run_period_start or ""
         row.run_period_end = cfg.run_period_end or ""
         row.runner_enabled = bool(cfg.runner_enabled)

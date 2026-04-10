@@ -261,7 +261,7 @@ async def save_config(
     new_sell = body.sell_start_time
     if prev and not (new_sell or "").strip() and (prev.sell_start_time or "").strip():
         new_sell = prev.sell_start_time
-    ri = max(1000, int(body.request_interval_ms or 1000))
+    ri = max(500, int(body.request_interval_ms or 1000))
     st.config = AppConfigIn(
         username=body.username.strip(),
         password=new_pw,
@@ -380,8 +380,8 @@ async def get_run_params(user: User = Depends(require_active_subscription), db: 
             sell_start_time="12:00",
         )
     ri = int(row.request_interval_ms or 1000)
-    if ri < 1000:
-        ri = 1000
+    if ri < 500:
+        ri = 500
     return RunParamsOut(
         quantity_start_limit=int(row.quantity_start_limit or 0),
         request_interval_ms=ri,
@@ -408,7 +408,7 @@ async def patch_run_params(
     st.config = prev.model_copy(
         update={
             "quantity_start_limit": body.quantity_start_limit,
-            "request_interval_ms": max(1000, int(body.request_interval_ms or 1000)),
+            "request_interval_ms": max(500, int(body.request_interval_ms or 1000)),
             "run_period_start": body.run_period_start,
             "run_period_end": body.run_period_end,
             "sell_start_time": body.sell_start_time or "",

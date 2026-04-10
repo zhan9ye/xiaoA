@@ -64,9 +64,9 @@ class AppConfigFormIn(BaseModel):
     )
     request_interval_ms: int = Field(
         default=1000,
-        ge=1000,
+        ge=500,
         le=60000,
-        description="子账号卖出请求间隔（毫秒）：≥1000；与全站 floor 取 max 作为实际间隔",
+        description="同一账号两次 ACE_Sell_Son 请求间隔（毫秒）：≥500，固定使用本配置",
     )
     run_period_start: str = Field(
         default="",
@@ -123,9 +123,9 @@ class AppConfigIn(BaseModel):
     )
     request_interval_ms: int = Field(
         default=1000,
-        ge=1000,
+        ge=500,
         le=60000,
-        description="ACE_Sell_Son 请求间隔（毫秒）：≥1000；与全站 floor 取 max",
+        description="ACE_Sell_Son 请求间隔（毫秒）：≥500，固定使用本配置",
     )
     run_period_start: str = Field(default="", description="子账号创建日筛选：区间起")
     run_period_end: str = Field(default="", description="子账号创建日筛选：区间止")
@@ -196,9 +196,9 @@ class RunParamsFormIn(BaseModel):
     )
     request_interval_ms: int = Field(
         default=1000,
-        ge=1000,
+        ge=500,
         le=60000,
-        description="子账号卖出请求间隔（毫秒）：≥1000；与全站 floor 取 max",
+        description="ACE_Sell_Son 请求间隔（毫秒）：≥500，固定使用本配置",
     )
     run_period_start: str = Field(default="", description="售卖时段开始日 YYYY-MM-DD；可空")
     run_period_end: str = Field(default="", description="售卖时段结束日 YYYY-MM-DD；可空")
