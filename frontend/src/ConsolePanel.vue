@@ -82,6 +82,10 @@ const logs = ref([]);
 const logBox = ref(null);
 const wsConnected = ref(false);
 const running = ref(false);
+/** 定时开售：运行中且本日仅内部等待（晚于开售缓冲才启动） */
+const timedSellInternalOnlyToday = ref(false);
+/** 未运行时：若此刻点开始将不会走对外售卖链路（已超过开售缓冲） */
+const timedSellWouldSkipOutboundIfStarted = ref(false);
 const saveMsg = ref("");
 const saveRunParamsMsg = ref("");
 const configCollapsed = ref(false);
@@ -880,6 +884,8 @@ async function refreshStatus() {
     if (r.ok) {
       const j = await r.json();
       running.value = !!j.running;
+      timedSellInternalOnlyToday.value = !!j.timed_sell_internal_only_today;
+      timedSellWouldSkipOutboundIfStarted.value = !!j.timed_sell_would_skip_outbound_if_started;
       if (j.floor_curr_ms != null) floorCurrMs.value = Number(j.floor_curr_ms);
       sr429Window.value = j.sr429_window != null && j.sr429_window !== undefined ? Number(j.sr429_window) : null;
       windowSamples.value = j.window_samples != null ? Number(j.window_samples) : 0;
@@ -1126,6 +1132,11 @@ onBeforeUnmount(() => {
                   type="button"
                   class="min-h-[2.5rem] flex-1 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 sm:flex-initial"
                   :disabled="running"
+                  :title="
+                    timedSellWouldSkipOutboundIfStarted
+                      ? '已超过今日开售缓冲：点开始将仅内部等待至次日，不调用登录/子账号/助记词/售卖'
+                      : ''
+                  "
                   @click="startRun"
                 >
                   开始
@@ -1150,6 +1161,14 @@ onBeforeUnmount(() => {
               </span>
               <span class="text-zinc-600">·</span>
               <span>任务 {{ running ? "运行中" : "已停止" }}</span>
+              <template v-if="timedSellInternalOnlyToday">
+                <span class="text-zinc-600">·</span>
+                <span class="text-amber-400/90">本日仅内部等待（不调对外售卖接口）</span>
+              </template>
+              <template v-else-if="timedSellWouldSkipOutboundIfStarted && !running">
+                <span class="text-zinc-600">·</span>
+                <span class="text-amber-400/90">已过开售缓冲，点开始将仅等到次日</span>
+              </template>
               <span class="text-zinc-600">·</span>
               <span>floor {{ floorCurrMs }}ms</span>
               <template v-if="sr429Window != null && windowSamples >= 100">

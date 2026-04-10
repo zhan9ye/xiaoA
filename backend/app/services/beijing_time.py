@@ -56,6 +56,20 @@ def seconds_until_next_beijing_midnight() -> float:
     return max(0.0, (midnight - now).total_seconds())
 
 
+def timed_sell_past_grace_deadline(sell_hhmm: str, grace_minutes: int) -> bool:
+    """
+    当前北京时间是否已超过「今日开售整点 + grace_minutes」。
+    用于晚于缓冲时间才启动任务时，本日跳过登录/子账号/助记词/售卖等对外 RPC。
+    """
+    tup = today_prep_and_start(sell_hhmm)
+    if not tup:
+        return False
+    _, start_dt = tup
+    g = max(0, int(grace_minutes))
+    deadline = start_dt + dt.timedelta(minutes=g)
+    return beijing_now() >= deadline
+
+
 def today_prep_and_start(sell_hhmm: str) -> Optional[Tuple[dt.datetime, dt.datetime]]:
     """
     今日开售的 (T-N 秒准备时刻, 整点开售时刻)，北京时间；N = settings.sell_prep_seconds_before。

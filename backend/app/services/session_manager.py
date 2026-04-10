@@ -47,7 +47,13 @@ class SessionManager:
                 }
                 if self._proxy_url:
                     kw["proxy"] = self._proxy_url
-                if settings.request_log_enabled and (settings.request_log_outbound_hosts or "").strip():
+                from app.middleware_request_log import http_request_log_file_ok
+
+                if (
+                    settings.request_log_enabled
+                    and (settings.request_log_outbound_hosts or "").strip()
+                    and http_request_log_file_ok()
+                ):
                     uid = self._platform_user_id
 
                     async def _response_log_hook(response: httpx.Response) -> None:

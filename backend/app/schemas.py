@@ -304,6 +304,10 @@ class RunStatus(BaseModel):
     floor_curr_ms: float = 50.0
     sr429_window: Optional[float] = None
     window_samples: int = 0
+    # 定时开售：当前是否处于「晚启动本日仅内部等待、不调对外 RPC」
+    timed_sell_internal_only_today: bool = False
+    # 未运行时：若此时点「开始」将触发上述内部等待（开售整点已过超过 sell_start_missed_grace_minutes）
+    timed_sell_would_skip_outbound_if_started: bool = False
 
 
 class UserRegisterIn(BaseModel):

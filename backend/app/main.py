@@ -3,6 +3,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -53,6 +54,7 @@ from app.services.mnemonic_segments import derive_mnemonic_str1
 from app.services.log_hub import LogLevel
 from app.services.login_response_parse import merge_from_rpc_login
 from app.services.login_service import rpc_login
+from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_deadline
 from app.services.runner import run_background
 from app.services.subaccount_service import FetchSubaccountsOutcome, fetch_all_subaccounts
 from app.services.totp_util import totp_now_from_secret_ex
@@ -71,7 +73,7 @@ from app.services.selling_eligibility import (
     enrich_subaccounts_with_listing_qty,
     listing_amounts_for_api,
 )
-from app.middleware_request_log import setup_request_file_logger
+from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
 from app.proxy_binding import get_session_manager_for_user_id
 from app.rpc_v import compute_js_timespan_v
 from app.trading_config_repo import ensure_trading_config_loaded, load_trading_config, persist_trading_config
@@ -85,6 +87,33 @@ def _trading_password_for_api(pw: str) -> str:
     if pw == " ":
         return ""
     return pw
+
+
+def _run_status_timed_sell_flags(st) -> Tuple[bool, bool]:
+    """(timed_sell_internal_only_today, timed_sell_would_skip_outbound_if_started)。"""
+    today = beijing_today_str()
+    running = st.runner_task is not None and not st.runner_task.done()
+    internal_only = running and (st.runner_late_start_skip_outbound_today or "").strip() == today
+    would_skip = False
+    if not running and st.config and (st.config.sell_start_time or "").strip():
+        g = max(0, int(settings.sell_start_missed_grace_minutes or 10))
+        would_skip = timed_sell_past_grace_deadline(st.config.sell_start_time, g)
+    return internal_only, would_skip
+
+
+def _apply_timed_sell_late_start_skip_flag(st, cfg: Optional[AppConfigIn]) -> None:
+    """
+    配置了 sell_start_time 且当前已超过「开售整点 + sell_start_missed_grace_minutes」时，
+    标记本北京日仅内部等待，runner 不调登录/子账号/助记词/售卖等对外接口。
+    """
+    if cfg is None or not (cfg.sell_start_time or "").strip():
+        st.runner_late_start_skip_outbound_today = ""
+        return
+    g = max(0, int(settings.sell_start_missed_grace_minutes or 10))
+    if timed_sell_past_grace_deadline(cfg.sell_start_time, g):
+        st.runner_late_start_skip_outbound_today = beijing_today_str()
+    else:
+        st.runner_late_start_skip_outbound_today = ""
 
 
 async def _resume_runner_tasks() -> None:
@@ -108,6 +137,8 @@ async def _resume_runner_tasks() -> None:
             continue
         st.config = cfg
         st.stop_event = asyncio.Event()
+        st.runner_must_refresh_trading_cache = True
+        _apply_timed_sell_late_start_skip_flag(st, cfg)
         st.runner_task = asyncio.create_task(run_background(uid, cfg))
 
 
@@ -118,9 +149,10 @@ async def lifespan(app: FastAPI):
         print("WARNING: 使用默认 JWT_SECRET，公网部署请在 .env 设置强随机 jwt_secret")
     if settings.request_log_enabled and (settings.request_log_outbound_hosts or "").strip():
         setup_request_file_logger()
-        print(
-            "出站 HTTP 日志：已启用（仅匹配 request_log_outbound_hosts），见 request_log_dir / http_requests.log"
-        )
+        if http_request_log_file_ok():
+            print(
+                "出站 HTTP 日志：已启用（仅匹配 request_log_outbound_hosts），见 request_log_dir / http_requests.log"
+            )
     await _resume_runner_tasks()
     yield
     await shutdown_all()
@@ -648,6 +680,7 @@ async def run_status(user: User = Depends(require_active_subscription), db: Asyn
     fl = get_floor_controller(user.id)
     floor_ms, sr429, nwin = fl.snapshot()
     enabled = bool(st.config.runner_enabled) if st.config else False
+    tio, tws = _run_status_timed_sell_flags(st)
     return RunStatus(
         running=running,
         last_error=st.last_runner_error,
@@ -655,6 +688,8 @@ async def run_status(user: User = Depends(require_active_subscription), db: Asyn
         floor_curr_ms=floor_ms,
         sr429_window=sr429,
         window_samples=nwin,
+        timed_sell_internal_only_today=tio,
+        timed_sell_would_skip_outbound_if_started=tws,
     )
 
 
@@ -669,6 +704,7 @@ async def run_start(
     if st.runner_task is not None and not st.runner_task.done():
         fl = get_floor_controller(user.id)
         fm, sr429, nwin = fl.snapshot()
+        tio, tws = _run_status_timed_sell_flags(st)
         return RunStatus(
             running=True,
             last_error=st.last_runner_error,
@@ -676,6 +712,8 @@ async def run_start(
             floor_curr_ms=fm,
             sr429_window=sr429,
             window_samples=nwin,
+            timed_sell_internal_only_today=tio,
+            timed_sell_would_skip_outbound_if_started=tws,
         )
 
     cfg = st.config
@@ -684,9 +722,12 @@ async def run_start(
     st.config = cfg.model_copy(update={"runner_enabled": True})
     await persist_trading_config(db, user.id, st.config)
     st.stop_event = asyncio.Event()
+    st.runner_must_refresh_trading_cache = True
+    _apply_timed_sell_late_start_skip_flag(st, st.config)
     st.runner_task = asyncio.create_task(run_background(user.id, st.config))
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
+    tio, tws = _run_status_timed_sell_flags(st)
     return RunStatus(
         running=True,
         last_error=None,
@@ -694,6 +735,8 @@ async def run_start(
         floor_curr_ms=fm,
         sr429_window=sr429,
         window_samples=nwin,
+        timed_sell_internal_only_today=tio,
+        timed_sell_would_skip_outbound_if_started=tws,
     )
 
 
@@ -714,6 +757,7 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
     st.runner_task = None
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
+    tio, tws = _run_status_timed_sell_flags(st)
     return RunStatus(
         running=False,
         last_error=st.last_runner_error,
@@ -721,6 +765,8 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
         floor_curr_ms=fm,
         sr429_window=sr429,
         window_samples=nwin,
+        timed_sell_internal_only_today=tio,
+        timed_sell_would_skip_outbound_if_started=tws,
     )
 
 

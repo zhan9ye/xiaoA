@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,12 @@ import httpx
 from app.settings import settings
 
 _logger: Optional[logging.Logger] = None
+# True 仅当 RotatingFileHandler 已成功挂载；否则出站日志不写文件（避免无权限时拖垮进程启动）
+_http_request_file_handler_ok: bool = False
+
+
+def http_request_log_file_ok() -> bool:
+    return _http_request_file_handler_ok
 
 
 def _format_body_for_log(raw: bytes, max_len: int) -> str:
@@ -77,23 +84,38 @@ def outbound_host_matches(host: str) -> bool:
 
 
 def setup_request_file_logger() -> logging.Logger:
-    global _logger
+    global _logger, _http_request_file_handler_ok
     if _logger is not None:
         return _logger
+
     base = Path(settings.request_log_dir or Path(__file__).resolve().parent.parent / "logs")
-    base.mkdir(parents=True, exist_ok=True)
     path = base / "http_requests.log"
     lg = logging.getLogger("app.http_requests")
-    lg.setLevel(logging.INFO)
     lg.handlers.clear()
-    fh = RotatingFileHandler(
-        path,
-        maxBytes=max(1_048_576, int(settings.request_log_max_bytes)),
-        backupCount=max(1, int(settings.request_log_backup_count)),
-        encoding="utf-8",
-    )
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    lg.addHandler(fh)
+    lg.setLevel(logging.INFO)
+
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(
+            path,
+            maxBytes=max(1_048_576, int(settings.request_log_max_bytes)),
+            backupCount=max(1, int(settings.request_log_backup_count)),
+            encoding="utf-8",
+        )
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        lg.addHandler(fh)
+        _http_request_file_handler_ok = True
+    except OSError as e:
+        _http_request_file_handler_ok = False
+        lg.addHandler(logging.NullHandler())
+        lg.setLevel(logging.CRITICAL)
+        print(
+            f"WARNING: 无法写入出站 HTTP 日志文件 {path} ({e!r})。"
+            f"已跳过文件日志，应用继续启动。请修正目录权限、"
+            f"在 .env 设置 REQUEST_LOG_DIR 指向可写目录，或设置 REQUEST_LOG_ENABLED=false。",
+            file=sys.stderr,
+        )
+
     lg.propagate = False
     _logger = lg
     return lg
@@ -116,7 +138,11 @@ async def httpx_outbound_response_log_hook(
     if not outbound_host_matches(host):
         return
 
-    lg = setup_request_file_logger()
+    setup_request_file_logger()
+    if not _http_request_file_handler_ok or _logger is None:
+        return
+
+    lg = _logger
     max_body = max(4096, int(settings.request_log_max_body))
 
     try:

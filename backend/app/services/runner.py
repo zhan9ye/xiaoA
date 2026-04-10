@@ -77,6 +77,66 @@ def _mark_ace_sell_sent(state: AppState, son_id: str) -> None:
     state.last_ace_sell_monotonic_by_son[son_id] = m
 
 
+def _clear_sell_mnemonic_cache(state: AppState) -> None:
+    state.sell_mnemonic_id1 = ""
+    state.sell_mnemonic_key = ""
+    state.sell_mnemonic_str1 = ""
+
+
+async def _refresh_sell_mnemonic_cache(
+    state: AppState,
+    sm,
+    log_hub: LogHub,
+    cfg: AppConfigIn,
+) -> bool:
+    """子账号列表就绪后调用一次 Mnemonic_Get01，写入 state 缓存。"""
+    rk = cfg.rpc_login_key.strip()
+    uid = cfg.rpc_user_id.strip()
+    if not rk or not uid:
+        return False
+    v_mn = compute_js_timespan_v()
+    ok_m, code_m, parsed_m, _raw_m = await post_mnemonic_get01(
+        sm, rpc_key=rk, user_id=uid, v=v_mn, lang="cn"
+    )
+    if ok_m and json_indicates_rpc_not_logged_in(parsed_m):
+        state.logged_in = False
+        await log_hub.push(LogLevel.warn, "Mnemonic_Get01 返回用戶未登錄")
+        return False
+    meta = parse_mnemonic_get01_response(parsed_m) if ok_m else None
+    if not meta:
+        await log_hub.push(
+            LogLevel.warn,
+            f"Mnemonic_Get01 失败 HTTP {code_m if ok_m else '?'}，无法缓存助记词",
+        )
+        return False
+    mid1 = str(meta["mnemonicid1"])
+    mkey = meta["mnemonickey"]
+    mstr = derive_mnemonic_str1(cfg.mnemonic, mid1) or ""
+    if not mstr:
+        await log_hub.push(LogLevel.error, "无法从配置助记词推导 mnemonicstr1，无法缓存")
+        return False
+    state.sell_mnemonic_id1 = mid1
+    state.sell_mnemonic_key = mkey
+    state.sell_mnemonic_str1 = mstr
+    await log_hub.push(
+        LogLevel.success,
+        "Mnemonic_Get01 已拉取并缓存（本轮售卖共用 mnemonicid1/mnemonickey/mnemonicstr1，不再重复请求）",
+    )
+    return True
+
+
+async def _ensure_sell_mnemonic_cached(
+    state: AppState,
+    sm,
+    log_hub: LogHub,
+    cfg: AppConfigIn,
+) -> bool:
+    """三者齐全则视为缓存命中；任一缺失则调用 Mnemonic_Get01 一次并重写缓存。"""
+    if state.sell_mnemonic_id1 and state.sell_mnemonic_key and state.sell_mnemonic_str1:
+        return True
+    return await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg)
+
+
 async def _rpc_login_merge_config(
     user_id: int,
     state: AppState,
@@ -106,7 +166,56 @@ async def _rpc_login_merge_config(
         state.logged_in = False
         await log_hub.push(LogLevel.error, "Login 未解析出 Key/UserID")
         return False, merged, rk, uid
+    _clear_sell_mnemonic_cache(state)
     return True, merged, rk, uid
+
+
+async def _full_login_subaccounts_mnemonic_sync(
+    user_id: int,
+    state: AppState,
+    log_hub: LogHub,
+    sm,
+    cfg: AppConfigIn,
+) -> Tuple[bool, List[dict]]:
+    """
+    强制链路：RPC Login → 全量 My_Subaccount → Mnemonic_Get01 写入助记词缓存。
+    用于订阅有效用户任务启动/恢复后、进入售卖前必须刷新内存态（与仅读旧缓存区分）。
+    """
+    ok_lm, merged, rk, uid = await _rpc_login_merge_config(user_id, state, log_hub, sm, cfg)
+    if not ok_lm or merged is None:
+        return False, []
+    cfg = merged
+    v_sub = compute_js_timespan_v()
+    sub_out = await fetch_all_subaccounts(
+        sm,
+        key=rk,
+        user_id=uid,
+        v=v_sub,
+        page_size=settings.subaccount_page_size,
+        max_pages=settings.subaccount_max_pages,
+        log_push=None,
+        silent=True,
+    )
+    if sub_out.not_logged_in or (not sub_out.first_page_ok and sub_out.first_page_status_code == 401):
+        state.logged_in = False
+        await log_hub.push(LogLevel.warn, "强制同步：子账号接口未登錄或 HTTP 401")
+        return False, []
+    if not sub_out.first_page_ok:
+        await log_hub.push(
+            LogLevel.warn,
+            f"强制同步：子账号首页失败 HTTP {sub_out.first_page_status_code}",
+        )
+        return False, []
+    items = list(sub_out.items)
+    state.subaccounts_cache = items
+    if not await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
+        await log_hub.push(LogLevel.error, "强制同步：Mnemonic_Get01 失败")
+        return False, []
+    await log_hub.push(
+        LogLevel.success,
+        f"强制同步完成：已登录、子账号 {len(items)} 条、助记词已写入缓存",
+    )
+    return True, items
 
 
 async def _fetch_subaccounts_resume_retries(
@@ -150,6 +259,9 @@ async def _fetch_subaccounts_resume_retries(
                 LogLevel.success,
                 f"补拉子账号成功，共 {len(sub_out.items)} 条（第 {attempt} 次）",
             )
+            if not await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
+                await log_hub.push(LogLevel.error, "补拉子账号后 Mnemonic_Get01 失败，返回空列表")
+                return []
             return list(sub_out.items)
         else:
             await log_hub.push(
@@ -194,6 +306,11 @@ async def _run_hot_maybe_recover_relogin(
     if cfg is None:
         return False, True
 
+    if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
+        await log_hub.push(LogLevel.error, "助记词缓存未就绪，无法进入 HotWindow")
+        state.last_runner_error = "助记词缓存失败"
+        return False, True
+
     set_sub_fetch_allowed(False)
     try:
         closed, relogin = await _hot_window_sell_session(
@@ -228,6 +345,10 @@ async def _run_hot_maybe_recover_relogin(
 
     cfg = state.config
     if cfg is None:
+        return False, True
+
+    if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
+        state.last_runner_error = "Login 后助记词缓存失败"
         return False, True
 
     set_sub_fetch_allowed(False)
@@ -293,6 +414,7 @@ async def _timed_prep_phase(
         state.config = merged
         cfg = merged
         state.logged_in = True
+        _clear_sell_mnemonic_cache(state)
         rk = cfg.rpc_login_key.strip()
         uid = cfg.rpc_user_id.strip()
         if not rk or not uid:
@@ -340,6 +462,9 @@ async def _timed_prep_phase(
             LogLevel.success,
             f"开售前准备：子账号列表已全量拉取，共 {len(items)} 条（尝试 {attempt}/{max_attempts}）",
         )
+        if not await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
+            await log_hub.push(LogLevel.error, "准备阶段：子账号已拉取但 Mnemonic_Get01 失败")
+            return False, [], cfg, rk, uid
         return True, items, cfg, rk, uid
 
     await log_hub.push(LogLevel.error, f"开售前准备失败：已达最大尝试次数 {max_attempts} 仍未成功")
@@ -359,7 +484,7 @@ async def _hot_window_sell_session(
 ) -> Tuple[bool, bool]:
     """
     HotWindow：禁止在本函数内调用 fetch_all_subaccounts（由外层 fetch 守卫保证）。
-    每笔 ACE_Sell_Son 前：间隔等待 → Mnemonic_Get01 → ACE_Sell_Son。
+    助记词仅使用 state 缓存（子账号拉取后已 Mnemonic_Get01 一次）；每笔 ACE_Sell_Son 前：间隔 → TOTP → ACE。
     返回 (channel_closed, relogin_recommended)。
     """
     today = beijing_today_str()
@@ -412,46 +537,32 @@ async def _hot_window_sell_session(
                 continue
             amt = cnt
 
+            mid1 = state.sell_mnemonic_id1
+            mkey = state.sell_mnemonic_key
+            mstr = state.sell_mnemonic_str1
+            if not mid1 or not mkey or not mstr:
+                await log_hub.push(
+                    LogLevel.info,
+                    "售卖助记词缓存不完整，尝试 Mnemonic_Get01 一次并回写缓存",
+                )
+                if await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
+                    mid1 = state.sell_mnemonic_id1
+                    mkey = state.sell_mnemonic_key
+                    mstr = state.sell_mnemonic_str1
+            if not mid1 or not mkey or not mstr:
+                await log_hub.push(
+                    LogLevel.error,
+                    "售卖助记词缓存仍不可用（请确认已登录且配置助记词正确），中止 HotWindow",
+                )
+                state.last_runner_error = "助记词缓存为空"
+                return False, True
+
             biz_success = False
             for attempt in range(1, 4):
                 if state.stop_event.is_set():
                     break
 
                 await _await_ace_interval_before_sell(state, cfg, son_id)
-
-                v_mn = compute_js_timespan_v()
-                ok_m, code_m, parsed_m, _raw_m = await post_mnemonic_get01(
-                    sm, rpc_key=rk, user_id=uid, v=v_mn, lang="cn"
-                )
-                if ok_m and json_indicates_rpc_not_logged_in(parsed_m):
-                    state.logged_in = False
-                    await log_hub.push(
-                        LogLevel.warn,
-                        "Mnemonic_Get01 返回用戶未登錄，中止 HotWindow，下轮将重新 Login",
-                    )
-                    state.last_runner_error = "Mnemonic_Get01 未登錄"
-                    return False, True
-
-                meta = parse_mnemonic_get01_response(parsed_m) if ok_m else None
-                if not meta:
-                    await log_hub.push(
-                        LogLevel.warn,
-                        f"Mnemonic_Get01 失败 sonId={son_id}（尝试 {attempt}/3），重试",
-                    )
-                    eff = _user_sell_interval_ms(cfg)
-                    if attempt < 3:
-                        await _sleep_between_sell_requests(state, eff)
-                    continue
-
-                mid1 = str(meta["mnemonicid1"])
-                mkey = meta["mnemonickey"]
-                mstr = derive_mnemonic_str1(cfg.mnemonic, mid1) or ""
-                if not mstr:
-                    await log_hub.push(
-                        LogLevel.error,
-                        f"无法推导 mnemonicstr1 sonId={son_id}，跳过本子账号本轮",
-                    )
-                    break
 
                 g, g_err = totp_now_from_secret_ex(cfg.key_token)
                 if not g:
@@ -589,6 +700,24 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
             if prep_start:
                 prep_dt, start_dt = prep_start
                 today_bj = beijing_today_str()
+                late_raw = (state.runner_late_start_skip_outbound_today or "").strip()
+                if late_raw and late_raw != today_bj:
+                    state.runner_late_start_skip_outbound_today = ""
+                    late_raw = ""
+                if late_raw == today_bj:
+                    await log_hub.push(
+                        LogLevel.warn,
+                        "本日因启动时间晚于开售缓冲，不调用登录/子账号/助记词/售卖；仅内部等待至北京次日。",
+                    )
+                    state.last_runner_error = "已超过开售缓冲时间，本日不执行对外售卖链路"
+                    sec = seconds_until_next_beijing_midnight()
+                    await log_hub.push(
+                        LogLevel.info,
+                        f"内部等待：约 {sec / 3600:.1f} 小时至北京时间次日 0 点",
+                    )
+                    await _wait_interruptible(state, sec)
+                    continue
+
                 sell_started = beijing_now() >= start_dt
                 if (
                     state.runner_sub_prep_date
@@ -601,6 +730,8 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                     )
                     state.subaccounts_cache = []
                     state.runner_sub_prep_date = ""
+                    _clear_sell_mnemonic_cache(state)
+                    state.runner_must_refresh_trading_cache = True
 
                 s1 = seconds_until_beijing(prep_dt)
                 if s1 > 0:
@@ -648,6 +779,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                             state.last_runner_error = "无子账号缓存且补拉失败"
                             await _wait_interruptible(state, interval)
                             continue
+                        state.runner_must_refresh_trading_cache = False
                 else:
                     if sell_started and not state.subaccounts_cache:
                         await log_hub.push(
@@ -668,6 +800,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                             await _wait_interruptible(state, interval)
                             continue
                         state.runner_sub_prep_date = today_bj
+                        state.runner_must_refresh_trading_cache = False
                     elif not sell_started:
                         prep_ok, items, cfg, rk, uid = await _timed_prep_phase(
                             user_id, state, log_hub, sm, start_dt
@@ -676,6 +809,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                             await _wait_interruptible(state, interval)
                             continue
                         state.runner_sub_prep_date = today_bj
+                        state.runner_must_refresh_trading_cache = False
 
                         if beijing_now() < start_dt:
                             await log_hub.push(LogLevel.info, "WaitOpen：等待开售整点（北京时间分段对齐）")
@@ -700,6 +834,26 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                     await log_hub.push(LogLevel.warn, "子账号列表为空，跳过售卖")
                     await _wait_interruptible(state, interval)
                     continue
+
+                cfg = state.config
+                if cfg is None:
+                    break
+
+                if state.runner_must_refresh_trading_cache:
+                    await log_hub.push(
+                        LogLevel.info,
+                        "任务已启动/恢复（订阅有效）：强制执行 登录 + 全量子账号 + Mnemonic_Get01 后再售卖",
+                    )
+                    ok_sync, items_sync = await _full_login_subaccounts_mnemonic_sync(
+                        user_id, state, log_hub, sm, cfg
+                    )
+                    if not ok_sync or not items_sync:
+                        state.last_runner_error = "强制同步（登录/子账号/助记词）失败"
+                        await _wait_interruptible(state, interval)
+                        continue
+                    items = items_sync
+                    state.runner_must_refresh_trading_cache = False
+                    state.runner_sub_prep_date = today_bj
 
                 if settings.runner_lease_enabled:
                     if not await try_acquire_runner_lease(user_id, lease_holder):
@@ -752,11 +906,31 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                     state.last_runner_error = "无子账号列表且补拉失败"
                     await _wait_interruptible(state, interval)
                     continue
+                state.runner_must_refresh_trading_cache = False
             else:
                 await log_hub.push(
                     LogLevel.info,
                     "无定时开售：使用内存子账号缓存优先尝试售卖（接口提示未登录再 Login）",
                 )
+
+            cfg = state.config
+            if cfg is None:
+                break
+
+            if state.runner_must_refresh_trading_cache:
+                await log_hub.push(
+                    LogLevel.info,
+                    "任务已启动/恢复（订阅有效）：强制执行 登录 + 全量子账号 + Mnemonic_Get01 后再售卖",
+                )
+                ok_sync, items_sync = await _full_login_subaccounts_mnemonic_sync(
+                    user_id, state, log_hub, sm, cfg
+                )
+                if not ok_sync or not items_sync:
+                    state.last_runner_error = "强制同步（登录/子账号/助记词）失败"
+                    await _wait_interruptible(state, interval)
+                    continue
+                items = items_sync
+                state.runner_must_refresh_trading_cache = False
 
             if settings.runner_lease_enabled:
                 if not await try_acquire_runner_lease(user_id, lease_holder):

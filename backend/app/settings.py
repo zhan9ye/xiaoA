@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     runner_loop_interval_seconds: int = 10
     # 配置了 sell_start_time 时：开售整点（北京时间）之前多少秒开始登录并拉取子账号（全量更新内存缓存一次）
     sell_prep_seconds_before: int = 30
+    # 若启动任务时北京时间已超过「开售整点 + 本分钟数」，本日不调用对外售卖链路 RPC，仅内部等待至次日
+    sell_start_missed_grace_minutes: int = 10
     # 配置了 sell_start_time 时：仅当「北京时间 ≥ 开售时刻 + 本秒数」后，ACE_Sell_Son 返回「本日交易通道已關閉」才视为真收工。
     # 避免上游晚 1～2 秒开门时，整点请求误把「尚未开放」当成通道已关。
     sell_channel_closed_trust_after_seconds: int = 60
