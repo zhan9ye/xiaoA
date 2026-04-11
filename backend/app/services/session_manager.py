@@ -41,7 +41,7 @@ class SessionManager:
         async with self._lock:
             if self._client is None:
                 kw: dict = {
-                    "timeout": 30.0,
+                    "timeout": settings.rpc_timeout_seconds or 30.0,
                     "follow_redirects": True,
                     "verify": _outbound_verify_ca_bundle() if settings.outbound_tls_verify else False,
                 }

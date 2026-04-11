@@ -6,11 +6,13 @@ from typing import List, Optional, Tuple
 from app.schemas import AppConfigIn
 from app.services.ace_sell_son_service import describe_ace_sell_response, post_ace_sell_son
 from app.services.beijing_time import (
+    BJ,
     beijing_now,
     beijing_today_str,
     seconds_until_beijing,
     seconds_until_next_beijing_midnight,
     today_prep_and_start,
+    wait_interruptible_until_beijing,
     wait_open_phases_beijing,
 )
 from app.services.channel_closed import response_indicates_channel_closed
@@ -471,6 +473,59 @@ async def _timed_prep_phase(
     return False, [], state.config, rk, uid
 
 
+async def _sell_open_warmup_loop(
+    state: AppState,
+    sm,
+    log_hub: LogHub,
+    start_dt: datetime,
+) -> None:
+    """
+    与 WaitOpen 并行：在开售整点前若干秒内周期性请求 Mnemonic_Get01 预热 TLS/TCP 连接。
+    选用 Mnemonic_Get01 而非 My_Subaccount：同域名同端口，返回极小 JSON，无副作用。
+    """
+    before = max(0, int(settings.sell_warmup_seconds_before_open or 0))
+    if before <= 0:
+        return
+    ping_sec = max(2.0, float(settings.sell_warmup_ping_interval_seconds or 6.0))
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=BJ)
+    first_at = start_dt - timedelta(seconds=before)
+    logged_start = False
+    while not state.stop_event.is_set():
+        now = beijing_now()
+        if now >= start_dt:
+            return
+        if now < first_at:
+            await wait_interruptible_until_beijing(state.stop_event, first_at)
+            continue
+        cfg = state.config
+        if cfg is None:
+            return
+        rk = cfg.rpc_login_key.strip()
+        uid = cfg.rpc_user_id.strip()
+        if not rk or not uid:
+            return
+        v = compute_js_timespan_v()
+        ok, code, _parsed, _raw = await post_mnemonic_get01(
+            sm, rpc_key=rk, user_id=uid, v=v, lang="cn"
+        )
+        if not logged_start:
+            await log_hub.push(
+                LogLevel.info,
+                f"开售连接预热：Mnemonic_Get01 保活（至整点前，间隔约 {ping_sec:.0f}s）",
+            )
+            logged_start = True
+        if not ok:
+            await log_hub.push(
+                LogLevel.warn,
+                f"开售预热：Mnemonic_Get01 HTTP {code}（将继续重试至整点）",
+            )
+        next_deadline = beijing_now() + timedelta(seconds=ping_sec)
+        if next_deadline > start_dt:
+            next_deadline = start_dt
+        await wait_interruptible_until_beijing(state.stop_event, next_deadline)
+
+
 async def _hot_window_sell_session(
     user_id: int,
     state: AppState,
@@ -484,13 +539,20 @@ async def _hot_window_sell_session(
 ) -> Tuple[bool, bool]:
     """
     HotWindow：禁止在本函数内调用 fetch_all_subaccounts（由外层 fetch 守卫保证）。
-    助记词仅使用 state 缓存（子账号拉取后已 Mnemonic_Get01 一次）；每笔 ACE_Sell_Son 前：间隔 → TOTP → ACE。
+    助记词使用 state 缓存；ACE_Sell_Son 在 Semaphore 控制下并发（hot_window_concurrency），
+    每笔仍遵守 request_interval_ms（同账户/同 sonId 节流）。
+    定时开售时：本函数内首轮并发 ACE 前先等待 sell_channel_closed_grace_retry_ms 再发第一批。
     返回 (channel_closed, relogin_recommended)。
     """
     today = beijing_today_str()
-    channel_closed = False
+    concurrency = max(1, int(settings.hot_window_concurrency or 1))
+    semaphore = asyncio.Semaphore(concurrency)
+    channel_ev = asyncio.Event()
+    relogin_ev = asyncio.Event()
+    cfg_lock = asyncio.Lock()
+    initial_batch_delay_applied = False
 
-    while not state.stop_event.is_set() and not channel_closed:
+    while not state.stop_event.is_set():
         cfg = state.config
         if cfg is None:
             break
@@ -514,159 +576,212 @@ async def _hot_window_sell_session(
             await log_hub.push(LogLevel.info, "当日待售子账号已处理完毕（无未成功且符合条件者）")
             break
 
-        await log_hub.push(LogLevel.info, f"售卖轮次：本轮待处理 {len(remaining_rows)} 个子账号")
+        await log_hub.push(
+            LogLevel.info,
+            f"售卖轮次：本轮待处理 {len(remaining_rows)} 个子账号（ACE 并发 {concurrency}）",
+        )
 
-        for row in remaining_rows:
-            if state.stop_event.is_set():
-                break
-            cfg = state.config
-            if cfg is None:
-                break
-            rk = cfg.rpc_login_key.strip()
-            uid = cfg.rpc_user_id.strip()
-            if not rk or not uid:
-                await log_hub.push(LogLevel.error, "配置缺少 Key/UserID，中止 HotWindow")
-                break
+        rk0 = cfg.rpc_login_key.strip()
+        uid0 = cfg.rpc_user_id.strip()
+        if not rk0 or not uid0:
+            await log_hub.push(LogLevel.error, "配置缺少 Key/UserID，中止 HotWindow")
+            break
 
+        mid1 = state.sell_mnemonic_id1
+        mkey = state.sell_mnemonic_key
+        mstr = state.sell_mnemonic_str1
+        if not mid1 or not mkey or not mstr:
+            await log_hub.push(
+                LogLevel.info,
+                "售卖助记词缓存不完整，尝试 Mnemonic_Get01 一次并回写缓存",
+            )
+            if await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
+                mid1 = state.sell_mnemonic_id1
+                mkey = state.sell_mnemonic_key
+                mstr = state.sell_mnemonic_str1
+        if not mid1 or not mkey or not mstr:
+            await log_hub.push(
+                LogLevel.error,
+                "售卖助记词缓存仍不可用（请确认已登录且配置助记词正确），中止 HotWindow",
+            )
+            state.last_runner_error = "助记词缓存为空"
+            return False, True
+
+        async def process_row(row: dict) -> None:
+            if channel_ev.is_set() or relogin_ev.is_set() or state.stop_event.is_set():
+                return
+            cfg0 = state.config
+            if cfg0 is None:
+                return
             son_id = resolve_son_id(row)
             if not son_id:
-                continue
+                return
             full_cnt = ace_amount_string_for_rpc(row)
-            cnt = effective_listing_amount_str(cfg, son_id, full_cnt) if full_cnt else ""
+            cnt = effective_listing_amount_str(cfg0, son_id, full_cnt) if full_cnt else ""
             if not cnt:
-                continue
+                return
             amt = cnt
+            m_a, m_b, m_c = state.sell_mnemonic_id1, state.sell_mnemonic_key, state.sell_mnemonic_str1
+            if not m_a or not m_b or not m_c:
+                return
 
-            mid1 = state.sell_mnemonic_id1
-            mkey = state.sell_mnemonic_key
-            mstr = state.sell_mnemonic_str1
-            if not mid1 or not mkey or not mstr:
-                await log_hub.push(
-                    LogLevel.info,
-                    "售卖助记词缓存不完整，尝试 Mnemonic_Get01 一次并回写缓存",
+            async with semaphore:
+                biz_success = False
+                trust_after = max(0, int(settings.sell_channel_closed_trust_after_seconds or 0))
+                grace_deadline = (
+                    sell_start_beijing + timedelta(seconds=trust_after)
+                    if sell_start_beijing is not None
+                    else None
                 )
-                if await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
-                    mid1 = state.sell_mnemonic_id1
-                    mkey = state.sell_mnemonic_key
-                    mstr = state.sell_mnemonic_str1
-            if not mid1 or not mkey or not mstr:
-                await log_hub.push(
-                    LogLevel.error,
-                    "售卖助记词缓存仍不可用（请确认已登录且配置助记词正确），中止 HotWindow",
-                )
-                state.last_runner_error = "助记词缓存为空"
-                return False, True
+                in_grace = grace_deadline is not None and beijing_now() < grace_deadline
+                max_attempts = 100 if in_grace else 3
+                logged_grace_for_son = False
+                for attempt in range(1, max_attempts + 1):
+                    if channel_ev.is_set() or relogin_ev.is_set() or state.stop_event.is_set():
+                        break
+                    cfg_row = state.config
+                    if cfg_row is None:
+                        break
 
-            biz_success = False
-            for attempt in range(1, 4):
-                if state.stop_event.is_set():
-                    break
+                    in_grace = grace_deadline is not None and beijing_now() < grace_deadline
+                    if not in_grace:
+                        await _await_ace_interval_before_sell(state, cfg_row, son_id)
 
-                await _await_ace_interval_before_sell(state, cfg, son_id)
+                    g, g_err = totp_now_from_secret_ex(cfg_row.key_token)
+                    if not g:
+                        await log_hub.push(
+                            LogLevel.error,
+                            f"无法生成 TOTP sonId={son_id}：{g_err or '请检查 key_token'}",
+                        )
+                        break
 
-                g, g_err = totp_now_from_secret_ex(cfg.key_token)
-                if not g:
-                    await log_hub.push(
-                        LogLevel.error,
-                        f"无法生成 TOTP：{g_err or '请检查 key_token'}",
+                    rk = cfg_row.rpc_login_key.strip()
+                    uid = cfg_row.rpc_user_id.strip()
+                    if not rk or not uid:
+                        break
+
+                    v_ace = compute_js_timespan_v()
+                    ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
+                        sm,
+                        amount=amt,
+                        password=cfg_row.password,
+                        son_id=son_id,
+                        mnemonic_id1=m_a,
+                        mnemonic_key=m_b,
+                        mnemonic_str1=m_c,
+                        g_code=g,
+                        count=cnt,
+                        rpc_key=rk,
+                        user_id=uid,
+                        v=v_ace,
                     )
-                    break
+                    _mark_ace_sell_sent(state, son_id)
+                    if lease_holder:
+                        await renew_runner_lease_if_holder(user_id, lease_holder)
 
-                v_ace = compute_js_timespan_v()
-                ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
-                    sm,
-                    amount=amt,
-                    password=cfg.password,
-                    son_id=son_id,
-                    mnemonic_id1=mid1,
-                    mnemonic_key=mkey,
-                    mnemonic_str1=mstr,
-                    g_code=g,
-                    count=cnt,
-                    rpc_key=rk,
-                    user_id=uid,
-                    v=v_ace,
-                )
-                _mark_ace_sell_sent(state, son_id)
-                if lease_holder:
-                    await renew_runner_lease_if_holder(user_id, lease_holder)
+                    is_429 = code_s == 429
 
-                is_429 = code_s == 429
+                    if response_indicates_channel_closed(parsed, raw_out):
+                        in_grace = grace_deadline is not None and beijing_now() < grace_deadline
+                        if in_grace:
+                            grace_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
+                            if not logged_grace_for_son:
+                                logged_grace_for_son = True
+                                await log_hub.push(
+                                    LogLevel.warn,
+                                    f"sonId={son_id} 通道尚未开放，信任窗口内短间隔重试（约 {grace_ms}ms）",
+                                )
+                            if grace_ms > 0 and attempt < max_attempts:
+                                await _sleep_between_sell_requests(state, grace_ms)
+                            continue
 
-                if response_indicates_channel_closed(parsed, raw_out):
-                    trust_after = max(0, int(settings.sell_channel_closed_trust_after_seconds or 0))
-                    grace_deadline = (
-                        sell_start_beijing + timedelta(seconds=trust_after)
-                        if sell_start_beijing is not None
-                        else None
-                    )
-                    if grace_deadline is not None and beijing_now() < grace_deadline:
-                        detail_grace = describe_ace_sell_response(code_s, parsed, raw_out)
+                        if not channel_ev.is_set():
+                            channel_ev.set()
+                            await log_hub.push(
+                                LogLevel.warn,
+                                "响应含「本日交易通道已關閉」，停止当日售卖循环",
+                            )
+                        return
+
+                    if json_indicates_rpc_not_logged_in(parsed):
+                        state.logged_in = False
+                        if not relogin_ev.is_set():
+                            relogin_ev.set()
+                            await log_hub.push(
+                                LogLevel.warn,
+                                "ACE_Sell_Son 返回用戶未登錄，中止 HotWindow，下轮将重新 Login",
+                            )
+                            state.last_runner_error = "ACE_Sell_Son 未登錄"
+                        return
+
+                    detail = describe_ace_sell_response(code_s, parsed, raw_out)
+                    json_err = isinstance(parsed, dict) and parsed.get("Error") is True
+                    rate_limited = is_429
+
+                    if ok_s and not json_err and not rate_limited:
+                        await log_hub.push(
+                            LogLevel.success,
+                            f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {detail}".strip()[:2600],
+                        )
+                        biz_success = True
+                        break
+                    if rate_limited:
                         await log_hub.push(
                             LogLevel.warn,
-                            (
-                                f"收到「本日交易通道已關閉」文案，但距配置开售未满 {trust_after}s，"
-                                f"视为通道可能尚未开放，继续重试：{detail_grace}"
-                            ).strip()[:2600],
+                            f"ACE_Sell_Son sonId={son_id} HTTP 429 限流：{detail}".strip()[:2600],
                         )
-                        eff = _user_sell_interval_ms(cfg)
-                        if attempt < 3:
-                            await _sleep_between_sell_requests(state, eff)
-                        continue
+                    else:
+                        tag = "业务失败(Error=true)" if json_err else "请求失败"
+                        await log_hub.push(
+                            LogLevel.error,
+                            f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {tag}：{detail}".strip()[:2600],
+                        )
 
-                    channel_closed = True
+                    eff = _user_sell_interval_ms(cfg_row)
+                    if attempt < max_attempts:
+                        await _sleep_between_sell_requests(state, eff)
+
+                if biz_success:
+                    async with cfg_lock:
+                        cfg_cur = state.config
+                        if cfg_cur is None:
+                            return
+                        new_json = add_sold_son_json(cfg_cur.sold_son_ids_json, today, son_id)
+                        new_cfg = cfg_cur.model_copy(update={"sold_son_ids_json": new_json})
+                        state.config = new_cfg
+                        try:
+                            await persist_trading_config_standalone(user_id, new_cfg)
+                        except Exception as ex:
+                            await log_hub.push(
+                                LogLevel.warn,
+                                f"已售子账号写入数据库失败: {ex}",
+                            )
+
+        if not initial_batch_delay_applied:
+            initial_batch_delay_applied = True
+            if sell_start_beijing is not None:
+                pre_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
+                if pre_ms > 0:
                     await log_hub.push(
-                        LogLevel.warn,
-                        "响应含「本日交易通道已關閉」，停止当日售卖循环",
+                        LogLevel.info,
+                        f"定时开售：首批 ACE 前等待 {pre_ms}ms（与 SELL_CHANNEL_CLOSED_GRACE_RETRY_MS 一致）",
                     )
-                    return True, False
+                    await _sleep_between_sell_requests(state, pre_ms)
 
-                if json_indicates_rpc_not_logged_in(parsed):
-                    state.logged_in = False
-                    await log_hub.push(
-                        LogLevel.warn,
-                        "ACE_Sell_Son 返回用戶未登錄，中止 HotWindow，下轮将重新 Login",
-                    )
-                    state.last_runner_error = "ACE_Sell_Son 未登錄"
-                    return False, True
+        results = await asyncio.gather(
+            *[process_row(r) for r in remaining_rows],
+            return_exceptions=True,
+        )
+        for res in results:
+            if isinstance(res, BaseException):
+                await log_hub.push(LogLevel.error, f"售卖并发任务异常：{res!r}")
 
-                detail = describe_ace_sell_response(code_s, parsed, raw_out)
-                json_err = isinstance(parsed, dict) and parsed.get("Error") is True
-                rate_limited = is_429
+        if channel_ev.is_set():
+            return True, False
+        if relogin_ev.is_set():
+            return False, True
 
-                if ok_s and not json_err and not rate_limited:
-                    await log_hub.push(
-                        LogLevel.success,
-                        f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {detail}".strip()[:2600],
-                    )
-                    biz_success = True
-                    break
-                if rate_limited:
-                    await log_hub.push(
-                        LogLevel.warn,
-                        f"ACE_Sell_Son sonId={son_id} HTTP 429 限流：{detail}".strip()[:2600],
-                    )
-                else:
-                    tag = "业务失败(Error=true)" if json_err else "请求失败"
-                    await log_hub.push(
-                        LogLevel.error,
-                        f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {tag}：{detail}".strip()[:2600],
-                    )
-
-                eff = _user_sell_interval_ms(cfg)
-                if attempt < 3:
-                    await _sleep_between_sell_requests(state, eff)
-
-            if biz_success:
-                new_json = add_sold_son_json(cfg.sold_son_ids_json, today, son_id)
-                new_cfg = cfg.model_copy(update={"sold_son_ids_json": new_json})
-                state.config = new_cfg
-                try:
-                    await persist_trading_config_standalone(user_id, new_cfg)
-                except Exception as ex:
-                    await log_hub.push(LogLevel.warn, f"已售子账号写入数据库失败: {ex}")
-
-    return channel_closed, False
+    return False, False
 
 
 async def run_background(user_id: int, config: AppConfigIn) -> None:
@@ -812,11 +927,17 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                         state.runner_must_refresh_trading_cache = False
 
                         if beijing_now() < start_dt:
-                            await log_hub.push(LogLevel.info, "WaitOpen：等待开售整点（北京时间分段对齐）")
-                            await wait_open_phases_beijing(
-                                state.stop_event,
-                                start_dt,
-                                settings.sell_wait_open_wake_early_ms,
+                            await log_hub.push(
+                                LogLevel.info,
+                                "WaitOpen：等待开售整点（与连接预热并行，北京时间分段对齐）",
+                            )
+                            await asyncio.gather(
+                                wait_open_phases_beijing(
+                                    state.stop_event,
+                                    start_dt,
+                                    settings.sell_wait_open_wake_early_ms,
+                                ),
+                                _sell_open_warmup_loop(state, sm, log_hub, start_dt),
                             )
                         if state.stop_event.is_set():
                             break
