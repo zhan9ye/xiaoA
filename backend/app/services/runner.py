@@ -315,16 +315,20 @@ async def _run_hot_maybe_recover_relogin(
 
     set_sub_fetch_allowed(False)
     try:
-        closed, relogin = await _hot_window_sell_session(
-            user_id,
-            state,
-            cfg,
-            log_hub,
-            sm,
-            items,
-            sell_start_beijing=sell_start_beijing,
-            lease_holder=lease_holder,
-        )
+        state.hot_sell_window_active = True
+        try:
+            closed, relogin = await _hot_window_sell_session(
+                user_id,
+                state,
+                cfg,
+                log_hub,
+                sm,
+                items,
+                sell_start_beijing=sell_start_beijing,
+                lease_holder=lease_holder,
+            )
+        finally:
+            state.hot_sell_window_active = False
     finally:
         set_sub_fetch_allowed(True)
 
@@ -357,16 +361,20 @@ async def _run_hot_maybe_recover_relogin(
 
     set_sub_fetch_allowed(False)
     try:
-        closed2, relogin2 = await _hot_window_sell_session(
-            user_id,
-            state,
-            cfg,
-            log_hub,
-            sm,
-            items2,
-            sell_start_beijing=sell_start_beijing,
-            lease_holder=lease_holder,
-        )
+        state.hot_sell_window_active = True
+        try:
+            closed2, relogin2 = await _hot_window_sell_session(
+                user_id,
+                state,
+                cfg,
+                log_hub,
+                sm,
+                items2,
+                sell_start_beijing=sell_start_beijing,
+                lease_holder=lease_holder,
+            )
+        finally:
+            state.hot_sell_window_active = False
     finally:
         set_sub_fetch_allowed(True)
     return closed2, relogin2
@@ -564,7 +572,6 @@ async def _hot_window_sell_session(
     定时开售时：本函数内首轮并发 ACE 前先等待 sell_channel_closed_grace_retry_ms 再发第一批。
     返回 (channel_closed, relogin_recommended)。
     """
-    state.hot_sell_session_started = True
     today = beijing_today_str()
     concurrency = max(1, int(settings.hot_window_concurrency or 1))
     semaphore = asyncio.Semaphore(concurrency)

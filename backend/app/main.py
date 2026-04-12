@@ -828,7 +828,7 @@ async def run_start(
     await persist_trading_config(db, user.id, st.config)
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
-    st.hot_sell_session_started = False
+    st.hot_sell_window_active = False
     _apply_timed_sell_late_start_skip_flag(st, st.config)
     st.runner_task = asyncio.create_task(run_background(user.id, st.config))
     fl = get_floor_controller(user.id)
@@ -862,7 +862,7 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
         except asyncio.CancelledError:
             pass
     st.runner_task = None
-    st.hot_sell_session_started = False
+    st.hot_sell_window_active = False
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
     tio, tws = _run_status_timed_sell_flags(st)

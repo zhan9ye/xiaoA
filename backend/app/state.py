@@ -26,5 +26,5 @@ class AppState:
     runner_must_refresh_trading_cache: bool = False
     # 定时开售：启动日晚于开售+缓冲时置为当日北京 YYYY-MM-DD，runner 本日仅内部等待、不调对外 RPC
     runner_late_start_skip_outbound_today: str = ""
-    # 无定时开售时：进入 HotWindow 后置 True，用于锁定子账号刷新与售卖排序（停任务后清零）
-    hot_sell_session_started: bool = False
+    # 仅在为 ACE_Sell_Son 跑 HotWindow 的时段内置 True；用于锁定子账号刷新与售卖排序（与是否已点「开始」无关）
+    hot_sell_window_active: bool = False
