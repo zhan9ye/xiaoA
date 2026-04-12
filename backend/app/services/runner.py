@@ -525,14 +525,18 @@ async def _hot_window_sell_session(
 ) -> Tuple[bool, bool]:
     """
     HotWindow：禁止在本函数内调用 fetch_all_subaccounts（由外层 fetch 守卫保证）。
-    助记词使用 state 缓存；ACE_Sell_Son 在 Semaphore 控制下并发（hot_window_concurrency），
-    每笔仍遵守 request_interval_ms（同账户/同 sonId 节流）。
+    助记词使用 state 缓存；ACE_Sell_Son 在 Semaphore 与 ace_pace_lock 下发送：
+    任意两次 ACE 之间须满足 request_interval_ms（含开售信任窗口内、不同子账号之间），
+    避免并发协程在更新 last_ace 前同时通过节流检查导致瞬时多请求。
+    信任窗口内同一子账号因「通道尚未开放」的第 2 次及以后请求不叠加 request_interval_ms，
+    仍仅按 sell_channel_closed_grace_retry_ms 间隔重试。
     定时开售时：本函数内首轮并发 ACE 前先等待 sell_channel_closed_grace_retry_ms 再发第一批。
     返回 (channel_closed, relogin_recommended)。
     """
     today = beijing_today_str()
     concurrency = max(1, int(settings.hot_window_concurrency or 1))
     semaphore = asyncio.Semaphore(concurrency)
+    ace_pace_lock = asyncio.Lock()
     channel_ev = asyncio.Event()
     relogin_ev = asyncio.Event()
     cfg_lock = asyncio.Lock()
@@ -626,43 +630,47 @@ async def _hot_window_sell_session(
                 for attempt in range(1, max_attempts + 1):
                     if channel_ev.is_set() or relogin_ev.is_set() or state.stop_event.is_set():
                         break
-                    cfg_row = state.config
-                    if cfg_row is None:
-                        break
 
                     in_grace = grace_deadline is not None and beijing_now() < grace_deadline
-                    if not in_grace:
-                        await _await_ace_interval_before_sell(state, cfg_row, son_id)
+                    apply_global_pacing = not (in_grace and attempt > 1)
 
-                    g, g_err = totp_now_from_secret_ex(cfg_row.key_token)
-                    if not g:
-                        await log_hub.push(
-                            LogLevel.error,
-                            f"无法生成 TOTP sonId={son_id}：{g_err or '请检查 key_token'}",
+                    async with ace_pace_lock:
+                        cfg_row = state.config
+                        if cfg_row is None:
+                            break
+                        if apply_global_pacing:
+                            await _await_ace_interval_before_sell(state, cfg_row, son_id)
+
+                        g, g_err = totp_now_from_secret_ex(cfg_row.key_token)
+                        if not g:
+                            await log_hub.push(
+                                LogLevel.error,
+                                f"无法生成 TOTP sonId={son_id}：{g_err or '请检查 key_token'}",
+                            )
+                            break
+
+                        rk = cfg_row.rpc_login_key.strip()
+                        uid = cfg_row.rpc_user_id.strip()
+                        if not rk or not uid:
+                            break
+
+                        v_ace = compute_js_timespan_v()
+                        ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
+                            sm,
+                            amount=amt,
+                            password=cfg_row.password,
+                            son_id=son_id,
+                            mnemonic_id1=m_a,
+                            mnemonic_key=m_b,
+                            mnemonic_str1=m_c,
+                            g_code=g,
+                            count=cnt,
+                            rpc_key=rk,
+                            user_id=uid,
+                            v=v_ace,
                         )
-                        break
+                        _mark_ace_sell_sent(state, son_id)
 
-                    rk = cfg_row.rpc_login_key.strip()
-                    uid = cfg_row.rpc_user_id.strip()
-                    if not rk or not uid:
-                        break
-
-                    v_ace = compute_js_timespan_v()
-                    ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
-                        sm,
-                        amount=amt,
-                        password=cfg_row.password,
-                        son_id=son_id,
-                        mnemonic_id1=m_a,
-                        mnemonic_key=m_b,
-                        mnemonic_str1=m_c,
-                        g_code=g,
-                        count=cnt,
-                        rpc_key=rk,
-                        user_id=uid,
-                        v=v_ace,
-                    )
-                    _mark_ace_sell_sent(state, son_id)
                     if lease_holder:
                         await renew_runner_lease_if_holder(user_id, lease_holder)
 
