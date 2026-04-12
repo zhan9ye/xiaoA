@@ -23,6 +23,7 @@ from app.schemas import (
     AppConfigFormIn,
     AppConfigIn,
     AppConfigOut,
+    AuthSiteInfoOut,
     ListingAmountPatchIn,
     LoginResult,
     MnemonicGet01Out,
@@ -174,6 +175,12 @@ app.add_middleware(
 @app.get("/api/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/api/auth/site-info", response_model=AuthSiteInfoOut)
+async def auth_site_info() -> AuthSiteInfoOut:
+    """匿名可读：用于登录页是否展示自助注册入口。"""
+    return AuthSiteInfoOut(registration_open=bool(settings.registration_open))
 
 
 @app.post("/api/auth/register", response_model=UserPublic)

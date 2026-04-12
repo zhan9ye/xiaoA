@@ -354,6 +354,12 @@ class RunStatus(BaseModel):
     subaccount_controls_locked: bool = False
 
 
+class AuthSiteInfoOut(BaseModel):
+    """登录页等匿名场景：是否开放自助注册（与 REGISTRATION_OPEN 一致）。"""
+
+    registration_open: bool
+
+
 class UserRegisterIn(BaseModel):
     username: str = Field(..., min_length=2, max_length=64)
     password: str = Field(..., min_length=6, max_length=128)

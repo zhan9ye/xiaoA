@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 
 const emit = defineEmits(["logged-in"]);
 
@@ -8,9 +8,33 @@ const password = ref("");
 const err = ref("");
 const loading = ref(false);
 const isRegister = ref(false);
+/** null=加载中；false=关闭自助注册，隐藏入口 */
+const registrationOpen = ref(null);
+
+onMounted(async () => {
+  try {
+    const r = await fetch("/api/auth/site-info");
+    if (r.ok) {
+      const j = await r.json();
+      registrationOpen.value = !!j.registration_open;
+    } else {
+      registrationOpen.value = false;
+    }
+  } catch {
+    registrationOpen.value = false;
+  }
+});
+
+watch(registrationOpen, (v) => {
+  if (v === false) isRegister.value = false;
+});
 
 async function submit() {
   err.value = "";
+  if (isRegister.value && registrationOpen.value === false) {
+    err.value = "注册已关闭，请联系管理员领取账号";
+    return;
+  }
   loading.value = true;
   try {
     const path = isRegister.value ? "/api/auth/register" : "/api/auth/token";
@@ -51,7 +75,11 @@ async function submit() {
       <div class="mb-8 text-center">
         <h1 class="text-3xl font-semibold tracking-tight text-violet-300">登录系统</h1>
         <p class="mt-2 text-sm text-zinc-500">
-          {{ isRegister ? "注册新账户以使用控制台" : "请使用平台账号与密码登录" }}
+          {{
+            isRegister && registrationOpen
+              ? "注册新账户以使用控制台"
+              : "请使用平台账号与密码登录"
+          }}
         </p>
       </div>
 
@@ -93,6 +121,7 @@ async function submit() {
           {{ isRegister ? "注册账户" : "进入系统" }}
         </button>
         <button
+          v-if="registrationOpen"
           type="button"
           class="mt-3 w-full text-center text-xs text-violet-400/80 hover:text-violet-300"
           @click="isRegister = !isRegister; err = ''"
