@@ -25,6 +25,7 @@ from app.schemas import (
     AppConfigIn,
     AppConfigOut,
     AuthSiteInfoOut,
+    ChangePasswordIn,
     ListingAmountPatchIn,
     LoginResult,
     MnemonicGet01Out,
@@ -273,6 +274,22 @@ async def login_token(request: Request, body: UserLoginIn, db: AsyncSession = De
 @app.get("/api/auth/me", response_model=UserPublic)
 async def me(user: User = Depends(get_current_user)):
     return UserPublic(id=user.id, username=user.username)
+
+
+@app.post("/api/auth/change-password")
+async def change_password(
+    body: ChangePasswordIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """已登录用户用旧密码校验后修改平台登录密码（仅需 JWT，不要求订阅有效）。"""
+    if not verify_password(body.old_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="当前密码不正确")
+    if body.old_password == body.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
+    user.password_hash = hash_password(body.new_password)
+    await db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/credits/overview", response_model=CreditsOverviewOut)

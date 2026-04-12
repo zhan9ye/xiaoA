@@ -119,6 +119,13 @@ const listingEditInput = ref("");
 const listingEditErr = ref("");
 const listingEditBusy = ref(false);
 
+const pwdChangeOpen = ref(false);
+const pwdChangeOld = ref("");
+const pwdChangeNew = ref("");
+const pwdChangeNew2 = ref("");
+const pwdChangeBusy = ref(false);
+const pwdChangeErr = ref("");
+
 let ws = null;
 
 const headers = () => ({
@@ -961,6 +968,62 @@ async function stopRun() {
   await refreshStatus();
 }
 
+function openPwdChange() {
+  pwdChangeErr.value = "";
+  pwdChangeOld.value = "";
+  pwdChangeNew.value = "";
+  pwdChangeNew2.value = "";
+  pwdChangeOpen.value = true;
+}
+
+function closePwdChange() {
+  if (pwdChangeBusy.value) return;
+  pwdChangeOpen.value = false;
+  pwdChangeErr.value = "";
+}
+
+async function submitPwdChange() {
+  pwdChangeErr.value = "";
+  const o = pwdChangeOld.value;
+  const n1 = pwdChangeNew.value;
+  const n2 = pwdChangeNew2.value;
+  if (!n1 || n1.length < 6) {
+    pwdChangeErr.value = "新密码至少 6 位";
+    return;
+  }
+  if (n1 !== n2) {
+    pwdChangeErr.value = "两次输入的新密码不一致";
+    return;
+  }
+  pwdChangeBusy.value = true;
+  try {
+    const r = await fetch("/api/auth/change-password", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ old_password: o, new_password: n1 }),
+    });
+    if (r.status === 401) {
+      emit("logout");
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const d = j.detail;
+      pwdChangeErr.value =
+        typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg || String(x)).join("；") : "修改失败";
+      return;
+    }
+    pwdChangeOpen.value = false;
+    pwdChangeOld.value = "";
+    pwdChangeNew.value = "";
+    pwdChangeNew2.value = "";
+  } catch {
+    pwdChangeErr.value = "网络错误";
+  } finally {
+    pwdChangeBusy.value = false;
+  }
+}
+
 watch(
   () => props.token,
   async () => {
@@ -997,6 +1060,13 @@ onBeforeUnmount(() => {
         当前用户 <span class="text-zinc-200">{{ displayName || "…" }}</span>
       </p>
       <div class="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+          @click="openPwdChange"
+        >
+          修改密码
+        </button>
         <button
           type="button"
           class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
@@ -1511,6 +1581,63 @@ onBeforeUnmount(() => {
             @click="confirmRedeem"
           >
             {{ redeemBusy ? "提交中…" : "确认兑换" }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="pwdChangeOpen"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/65 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="pwd-change-title"
+      @click.self="closePwdChange"
+    >
+      <div class="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl ring-1 ring-black/50">
+        <h3 id="pwd-change-title" class="mb-2 text-sm font-semibold text-zinc-100">修改登录密码</h3>
+        <p class="mb-4 text-xs text-zinc-500">须验证当前密码；新密码至少 6 位。修改成功后请使用新密码登录。</p>
+        <label class="mb-1 block text-xs text-zinc-500">当前密码</label>
+        <input
+          v-model="pwdChangeOld"
+          type="password"
+          autocomplete="current-password"
+          class="mb-3 w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm text-zinc-100 outline-none ring-violet-500/50 focus:ring-2"
+        />
+        <label class="mb-1 block text-xs text-zinc-500">新密码</label>
+        <input
+          v-model="pwdChangeNew"
+          type="password"
+          autocomplete="new-password"
+          class="mb-3 w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm text-zinc-100 outline-none ring-violet-500/50 focus:ring-2"
+        />
+        <label class="mb-1 block text-xs text-zinc-500">确认新密码</label>
+        <input
+          v-model="pwdChangeNew2"
+          type="password"
+          autocomplete="new-password"
+          class="mb-2 w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm text-zinc-100 outline-none ring-violet-500/50 focus:ring-2"
+          @keyup.enter="submitPwdChange"
+        />
+        <p v-if="pwdChangeErr" class="mb-3 text-xs text-amber-400/90">{{ pwdChangeErr }}</p>
+        <div class="flex justify-end gap-2">
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+            :disabled="pwdChangeBusy"
+            @click="closePwdChange"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
+            :disabled="pwdChangeBusy"
+            @click="submitPwdChange"
+          >
+            {{ pwdChangeBusy ? "提交中…" : "保存" }}
           </button>
         </div>
       </div>

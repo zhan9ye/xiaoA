@@ -372,6 +372,11 @@ class UserLoginIn(BaseModel):
     captcha_answer: Optional[str] = Field(default=None, description="验证码答案（算术题结果）")
 
 
+class ChangePasswordIn(BaseModel):
+    old_password: str = Field(..., min_length=1, description="当前密码")
+    new_password: str = Field(..., min_length=6, max_length=128, description="新密码")
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
