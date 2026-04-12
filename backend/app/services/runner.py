@@ -29,6 +29,7 @@ from app.services.selling_eligibility import (
     effective_listing_amount_str,
     resolve_son_id,
     resolve_subaccount_display_name,
+    sort_subaccounts_for_sell,
     subaccount_eligible_for_ace_sell,
 )
 from app.services.sold_son_store import add_sold_son_json, sold_son_ids_for_today
@@ -305,6 +306,8 @@ async def _run_hot_maybe_recover_relogin(
     if cfg is None:
         return False, True
 
+    items = sort_subaccounts_for_sell(list(items), cfg)
+
     if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
         await log_hub.push(LogLevel.error, "助记词缓存未就绪，无法进入 HotWindow")
         state.last_runner_error = "助记词缓存失败"
@@ -345,6 +348,8 @@ async def _run_hot_maybe_recover_relogin(
     cfg = state.config
     if cfg is None:
         return False, True
+
+    items2 = sort_subaccounts_for_sell(items2, cfg)
 
     if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
         state.last_runner_error = "Login 后助记词缓存失败"
@@ -512,6 +517,32 @@ async def _sell_open_warmup_loop(
         await wait_interruptible_until_beijing(state.stop_event, next_deadline)
 
 
+async def _sell_start_countdown_logs(
+    state: AppState,
+    start_dt: datetime,
+    log_hub: LogHub,
+) -> None:
+    """开售整点前 60 秒起：每 10 秒一条，最后 10 秒每秒一条。"""
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=BJ)
+    milestones = [60, 50, 40, 30, 20, 10] + list(range(9, 0, -1))
+    for d in milestones:
+        if state.stop_event.is_set():
+            return
+        target = start_dt - timedelta(seconds=d)
+        now = beijing_now()
+        if now >= start_dt:
+            return
+        if now >= target:
+            continue
+        await wait_interruptible_until_beijing(state.stop_event, target)
+        if state.stop_event.is_set():
+            return
+        if beijing_now() >= start_dt:
+            return
+        await log_hub.push(LogLevel.info, f"距离开售还有约 {d} 秒")
+
+
 async def _hot_window_sell_session(
     user_id: int,
     state: AppState,
@@ -533,6 +564,7 @@ async def _hot_window_sell_session(
     定时开售时：本函数内首轮并发 ACE 前先等待 sell_channel_closed_grace_retry_ms 再发第一批。
     返回 (channel_closed, relogin_recommended)。
     """
+    state.hot_sell_session_started = True
     today = beijing_today_str()
     concurrency = max(1, int(settings.hot_window_concurrency or 1))
     semaphore = asyncio.Semaphore(concurrency)
@@ -848,10 +880,6 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
 
                 s1 = seconds_until_beijing(prep_dt)
                 if s1 > 0:
-                    await log_hub.push(
-                        LogLevel.info,
-                        f"PreWait：约 {s1:.0f} 秒后进行准备（登录 + 子账号），此阶段不发 RPC",
-                    )
                     await _wait_interruptible(state, s1)
                 if state.stop_event.is_set():
                     break
@@ -932,6 +960,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                                     settings.sell_wait_open_wake_early_ms,
                                 ),
                                 _sell_open_warmup_loop(state, sm, log_hub, start_dt),
+                                _sell_start_countdown_logs(state, start_dt, log_hub),
                             )
                         if state.stop_event.is_set():
                             break

@@ -22,6 +22,10 @@ def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
     ri = int(row.request_interval_ms or 1000)
     if ri < 500:
         ri = 500
+    ssf = (getattr(row, "sell_sort_field", None) or "create_time").strip()
+    if ssf not in ("create_time", "ace_amount"):
+        ssf = "create_time"
+    ssd = bool(getattr(row, "sell_sort_desc", False))
     return AppConfigIn.model_construct(
         username=(row.username or "").strip() or "user",
         password=pw,
@@ -37,6 +41,8 @@ def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
         sell_start_time=(getattr(row, "sell_start_time", None) or "") or "",
         sold_son_ids_json=(getattr(row, "sold_son_ids_json", None) or "") or "{}",
         listing_amounts_json=(getattr(row, "listing_amounts_json", None) or "") or "{}",
+        sell_sort_field=ssf,
+        sell_sort_desc=ssd,
     )
 
 
@@ -56,6 +62,9 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
     key_enc = encrypt_trading_field(cfg.key_token)
     mn_enc = encrypt_trading_field(cfg.mnemonic)
     rk_enc = encrypt_trading_field(cfg.rpc_login_key)
+    ssf = (cfg.sell_sort_field or "create_time").strip()
+    if ssf not in ("create_time", "ace_amount"):
+        ssf = "create_time"
     if row is None:
         row = TradingConfig(
             user_id=user_id,
@@ -74,6 +83,8 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
             sell_start_time=cfg.sell_start_time or "",
             sold_son_ids_json=cfg.sold_son_ids_json or "{}",
             listing_amounts_json=cfg.listing_amounts_json or "{}",
+            sell_sort_field=ssf,
+            sell_sort_desc=bool(cfg.sell_sort_desc),
         )
         session.add(row)
     else:
@@ -92,6 +103,8 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
         row.sell_start_time = cfg.sell_start_time or ""
         row.sold_son_ids_json = cfg.sold_son_ids_json or "{}"
         row.listing_amounts_json = cfg.listing_amounts_json or "{}"
+        row.sell_sort_field = ssf
+        row.sell_sort_desc = bool(cfg.sell_sort_desc)
     await session.commit()
 
 

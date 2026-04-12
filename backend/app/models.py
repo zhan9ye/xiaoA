@@ -97,3 +97,6 @@ class TradingConfig(Base):
     sold_son_ids_json: Mapped[str] = mapped_column(Text, default="{}")
     # {"sonId":"挂售数量"} 字符串；未出现的 sonId 表示挂售数量=全部股数（AceAmount）
     listing_amounts_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 售卖时子账号顺序：create_time（创建日）或 ace_amount（股数）；sell_sort_desc 为 True 表示降序
+    sell_sort_field: Mapped[str] = mapped_column(String(32), default="create_time")
+    sell_sort_desc: Mapped[bool] = mapped_column(Boolean, default=False)

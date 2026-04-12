@@ -193,6 +193,28 @@ def effective_listing_amount_str(cfg: AppConfigIn, son_id: str, full_amount_str:
     return _normalize_amount_token(v)
 
 
+def sort_subaccounts_for_sell(rows: List[Dict[str, Any]], cfg: AppConfigIn) -> List[Dict[str, Any]]:
+    """
+    按配置 sell_sort_field / sell_sort_desc 排序（同键时保持原相对顺序）。
+    """
+    if not rows:
+        return []
+    field = (getattr(cfg, "sell_sort_field", None) or "create_time").strip()
+    if field not in ("create_time", "ace_amount"):
+        field = "create_time"
+    desc = bool(getattr(cfg, "sell_sort_desc", False))
+
+    def pk_val(row: Dict[str, Any]):
+        if field == "ace_amount":
+            v = _parse_ace_amount(row)
+            return float("-inf") if v is None else float(v)
+        return _parse_created_day_yyyy_mm_dd(row) or ""
+
+    decorated = [(pk_val(r), i, r) for i, r in enumerate(rows)]
+    decorated.sort(key=lambda t: (t[0], t[1]), reverse=desc)
+    return [t[2] for t in decorated]
+
+
 def enrich_subaccounts_with_listing_qty(items: List[Dict[str, Any]], cfg: AppConfigIn) -> List[Dict[str, Any]]:
     """
     为每条子账号浅拷贝并写入 ListingQty：listing_amounts_json 有该 sonId 用库中值，否则为全部股数。

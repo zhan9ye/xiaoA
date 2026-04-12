@@ -86,6 +86,12 @@ const running = ref(false);
 const timedSellInternalOnlyToday = ref(false);
 /** 未运行时：若此刻点开始将不会走对外售卖链路（已超过开售缓冲） */
 const timedSellWouldSkipOutboundIfStarted = ref(false);
+/** 开售进行中：禁止改售卖顺序、禁止刷新子账号（与 /api/run/status 一致） */
+const subaccountControlsLocked = ref(false);
+/** 售卖顺序：create_time=创建日，ace_amount=股数 */
+const sellSortField = ref("create_time");
+/** false=升序 true=降序 */
+const sellSortDesc = ref(false);
 const saveMsg = ref("");
 const saveRunParamsMsg = ref("");
 const configCollapsed = ref(false);
@@ -430,6 +436,25 @@ function parseCreatedDay(row) {
   return null;
 }
 
+function compareSubaccountsForSellOrder(a, b) {
+  const field = sellSortField.value || "create_time";
+  const desc = !!sellSortDesc.value;
+  let cmp = 0;
+  if (field === "ace_amount") {
+    const va = parseAceAmount(a);
+    const vb = parseAceAmount(b);
+    const na = va == null ? Number.NEGATIVE_INFINITY : Number(va);
+    const nb = vb == null ? Number.NEGATIVE_INFINITY : Number(vb);
+    cmp = na === nb ? 0 : na < nb ? -1 : 1;
+  } else {
+    const da = parseCreatedDay(a) || "";
+    const db = parseCreatedDay(b) || "";
+    cmp = da < db ? -1 : da > db ? 1 : 0;
+  }
+  if (desc) cmp = -cmp;
+  return cmp;
+}
+
 function isEligibleByRunParams(row) {
   const ace = parseAceAmount(row);
   if (ace == null) return false;
@@ -486,13 +511,13 @@ const displayedSubaccounts = computed(() => {
   const list = subaccounts.value;
   const byOriginalIndex = new Map();
   for (let i = 0; i < list.length; i++) byOriginalIndex.set(list[i], i);
-  if (showOnlyEligible.value) {
-    return list.filter((row) => isEligibleByRunParams(row));
-  }
-  return [...list].sort((a, b) => {
+  const rows = showOnlyEligible.value ? list.filter((row) => isEligibleByRunParams(row)) : [...list];
+  return rows.sort((a, b) => {
     const ea = isEligibleByRunParams(a) ? 0 : 1;
     const eb = isEligibleByRunParams(b) ? 0 : 1;
     if (ea !== eb) return ea - eb;
+    const c = compareSubaccountsForSellOrder(a, b);
+    if (c !== 0) return c;
     return (byOriginalIndex.get(a) ?? 0) - (byOriginalIndex.get(b) ?? 0);
   });
 });
@@ -664,6 +689,10 @@ async function loadRunParamsFromServer() {
     applySellStartFromApi(rp.sell_start_time);
     runPeriodStart.value = rp.run_period_start || "";
     runPeriodEnd.value = rp.run_period_end || "";
+    if (rp.sell_sort_field === "create_time" || rp.sell_sort_field === "ace_amount") {
+      sellSortField.value = rp.sell_sort_field;
+    }
+    if (rp.sell_sort_desc != null) sellSortDesc.value = !!rp.sell_sort_desc;
   } catch (_) {}
 }
 
@@ -692,6 +721,10 @@ async function loadConfig() {
       } else {
         listingAmountsMap.value = {};
       }
+      if (j.sell_sort_field === "create_time" || j.sell_sort_field === "ace_amount") {
+        sellSortField.value = j.sell_sort_field;
+      }
+      if (j.sell_sort_desc != null) sellSortDesc.value = !!j.sell_sort_desc;
     } else {
       mnemonicParts.value = Array.from({ length: MNEMONIC_SEGMENTS }, () => "");
       listingAmountsMap.value = {};
@@ -731,6 +764,16 @@ async function refreshSubaccounts() {
       emit("logout");
       return;
     }
+    if (r.status === 403) {
+      try {
+        const err = await r.json();
+        const d = err.detail;
+        subaccountsRefreshMsg.value = typeof d === "string" ? d : "开售进行中，禁止刷新子账号";
+      } catch {
+        subaccountsRefreshMsg.value = "开售进行中，禁止刷新子账号";
+      }
+      return;
+    }
     if (!r.ok) {
       try {
         const err = await r.json();
@@ -767,6 +810,8 @@ async function saveConfig() {
     run_period_start: runPeriodStart.value || "",
     run_period_end: runPeriodEnd.value || "",
     sell_start_time: sellStartTime.value.trim(),
+    sell_sort_field: sellSortField.value,
+    sell_sort_desc: !!sellSortDesc.value,
   };
   try {
     const r = await fetch("/api/config", {
@@ -806,6 +851,10 @@ async function saveConfig() {
     if (saved.listing_amounts && typeof saved.listing_amounts === "object") {
       listingAmountsMap.value = { ...saved.listing_amounts };
     }
+    if (saved.sell_sort_field === "create_time" || saved.sell_sort_field === "ace_amount") {
+      sellSortField.value = saved.sell_sort_field;
+    }
+    if (saved.sell_sort_desc != null) sellSortDesc.value = !!saved.sell_sort_desc;
     if (saved.password != null) tradePassword.value = String(saved.password);
     saveMsg.value = "已保存";
     connectWs();
@@ -823,6 +872,8 @@ async function saveRunParams() {
     run_period_start: runPeriodStart.value || "",
     run_period_end: runPeriodEnd.value || "",
     sell_start_time: sellStartTime.value.trim(),
+    sell_sort_field: sellSortField.value,
+    sell_sort_desc: !!sellSortDesc.value,
   };
   try {
     const r = await fetch("/api/config/run-params", {
@@ -857,6 +908,10 @@ async function saveRunParams() {
     } else {
       sellTimeCommitted.value = normalizeSellStart(sellStartTime.value);
     }
+    if (saved.sell_sort_field === "create_time" || saved.sell_sort_field === "ace_amount") {
+      sellSortField.value = saved.sell_sort_field;
+    }
+    if (saved.sell_sort_desc != null) sellSortDesc.value = !!saved.sell_sort_desc;
     saveRunParamsMsg.value = "已保存";
   } catch {
     saveRunParamsMsg.value = "网络错误";
@@ -886,6 +941,7 @@ async function refreshStatus() {
       running.value = !!j.running;
       timedSellInternalOnlyToday.value = !!j.timed_sell_internal_only_today;
       timedSellWouldSkipOutboundIfStarted.value = !!j.timed_sell_would_skip_outbound_if_started;
+      subaccountControlsLocked.value = !!j.subaccount_controls_locked;
       if (j.floor_curr_ms != null) floorCurrMs.value = Number(j.floor_curr_ms);
       sr429Window.value = j.sr429_window != null && j.sr429_window !== undefined ? Number(j.sr429_window) : null;
       windowSamples.value = j.window_samples != null ? Number(j.window_samples) : 0;
@@ -1239,12 +1295,47 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="rounded border border-zinc-600 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
-                :disabled="subaccountsRefreshBusy"
+                :disabled="subaccountsRefreshBusy || subaccountControlsLocked"
                 @click="refreshSubaccounts"
               >
                 {{ subaccountsRefreshBusy ? "加载中…" : "刷新" }}
               </button>
             </div>
+          </div>
+          <p
+            v-if="subaccountControlsLocked"
+            class="border-b border-line px-4 py-1.5 text-xs text-amber-500/90"
+          >
+            开售进行中：已锁定子账号刷新与售卖顺序。
+          </p>
+          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2 text-xs">
+            <span class="text-zinc-500">售卖顺序</span>
+            <select
+              v-model="sellSortField"
+              class="rounded border border-line bg-black/40 px-2 py-1 text-zinc-200 outline-none ring-blue-500 focus:ring-1 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="subaccountControlsLocked"
+            >
+              <option value="create_time">创建时间</option>
+              <option value="ace_amount">股数</option>
+            </select>
+            <select
+              class="rounded border border-line bg-black/40 px-2 py-1 text-zinc-200 outline-none ring-blue-500 focus:ring-1 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="subaccountControlsLocked"
+              :value="sellSortDesc ? 'desc' : 'asc'"
+              @change="sellSortDesc = $event.target.value === 'desc'"
+            >
+              <option value="asc">升序</option>
+              <option value="desc">降序</option>
+            </select>
+            <button
+              type="button"
+              class="rounded border border-zinc-600 px-2 py-0.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+              :disabled="subaccountControlsLocked"
+              @click="saveRunParams"
+            >
+              保存顺序
+            </button>
+            <span class="text-zinc-600">（保存后与后台实际售卖顺序一致）</span>
           </div>
           <p
             v-if="subaccountsRefreshMsg"

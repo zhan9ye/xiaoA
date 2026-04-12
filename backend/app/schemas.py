@@ -81,6 +81,19 @@ class AppConfigFormIn(BaseModel):
         default="12:00",
         description="北京时间售卖开始 HH:MM；留空则不等待固定时刻",
     )
+    sell_sort_field: str = Field(
+        default="create_time",
+        description="子账号售卖顺序：create_time=创建日，ace_amount=股数",
+    )
+    sell_sort_desc: bool = Field(default=False, description="True=降序，False=升序")
+
+    @field_validator("sell_sort_field", mode="before")
+    @classmethod
+    def _v_sell_sort_field_form(cls, v: Any) -> str:
+        s = (str(v) if v is not None else "create_time").strip()
+        if s not in ("create_time", "ace_amount"):
+            raise ValueError("sell_sort_field 须为 create_time 或 ace_amount")
+        return s
 
     @field_validator("sell_start_time", mode="before")
     @classmethod
@@ -136,6 +149,8 @@ class AppConfigIn(BaseModel):
         default="{}",
         description='按子账号覆盖挂售数量 JSON：{"sonId":"数量"}；缺省则挂售全部股数',
     )
+    sell_sort_field: str = Field(default="create_time")
+    sell_sort_desc: bool = Field(default=False)
 
     @field_validator("run_period_start", "run_period_end", mode="before")
     @classmethod
@@ -150,6 +165,14 @@ class AppConfigIn(BaseModel):
         if v is None:
             return ""
         return _normalize_hhmm_beijing(str(v))
+
+    @field_validator("sell_sort_field", mode="before")
+    @classmethod
+    def _v_sell_sort_field_in(cls, v: Any) -> str:
+        s = (str(v) if v is not None else "create_time").strip()
+        if s not in ("create_time", "ace_amount"):
+            return "create_time"
+        return s
 
     @model_validator(mode="after")
     def _v_period_order_in(self):
@@ -172,6 +195,8 @@ class AppConfigOut(BaseModel):
     run_period_start: str
     run_period_end: str
     sell_start_time: str = ""
+    sell_sort_field: str = "create_time"
+    sell_sort_desc: bool = False
     listing_amounts: Dict[str, str] = Field(
         default_factory=dict,
         description="挂售数量覆盖 sonId→数量；缺省键表示用全部股数",
@@ -203,6 +228,11 @@ class RunParamsFormIn(BaseModel):
     run_period_start: str = Field(default="", description="售卖时段开始日 YYYY-MM-DD；可空")
     run_period_end: str = Field(default="", description="售卖时段结束日 YYYY-MM-DD；可空")
     sell_start_time: str = Field(default="12:00", description="北京时间售卖开始 HH:MM；空则不等待固定时刻")
+    sell_sort_field: Optional[str] = Field(
+        default=None,
+        description="create_time 或 ace_amount；省略则保留原值",
+    )
+    sell_sort_desc: Optional[bool] = Field(default=None, description="降序；省略则保留原值")
 
     @field_validator("run_period_start", "run_period_end", mode="before")
     @classmethod
@@ -218,6 +248,16 @@ class RunParamsFormIn(BaseModel):
             return ""
         return _normalize_hhmm_beijing(str(v))
 
+    @field_validator("sell_sort_field", mode="before")
+    @classmethod
+    def _v_sell_sort_field_rp(cls, v: Any) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        s = str(v).strip()
+        if s not in ("create_time", "ace_amount"):
+            raise ValueError("sell_sort_field 须为 create_time 或 ace_amount")
+        return s
+
     @model_validator(mode="after")
     def _v_period_order_rp(self):
         if self.run_period_start and self.run_period_end:
@@ -232,6 +272,8 @@ class RunParamsOut(BaseModel):
     run_period_start: str
     run_period_end: str
     sell_start_time: str = ""
+    sell_sort_field: str = "create_time"
+    sell_sort_desc: bool = False
 
 
 class SubaccountsOut(BaseModel):
@@ -308,6 +350,8 @@ class RunStatus(BaseModel):
     timed_sell_internal_only_today: bool = False
     # 未运行时：若此时点「开始」将触发上述内部等待（开售整点已过超过 sell_start_missed_grace_minutes）
     timed_sell_would_skip_outbound_if_started: bool = False
+    # 开售进行中：禁止刷新子账号、改售卖排序
+    subaccount_controls_locked: bool = False
 
 
 class UserRegisterIn(BaseModel):

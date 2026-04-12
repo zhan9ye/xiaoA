@@ -73,6 +73,7 @@ from app.services.selling_eligibility import (
     enrich_subaccounts_with_listing_qty,
     listing_amounts_for_api,
 )
+from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
 from app.proxy_binding import get_session_manager_for_user_id
 from app.rpc_v import compute_js_timespan_v
@@ -271,6 +272,9 @@ async def save_config(
     st = await get_or_create_state(user.id)
     await ensure_trading_config_loaded(db, user.id, st)
     prev = st.config
+    if subaccount_controls_locked(st) and prev is not None:
+        if body.sell_sort_field != prev.sell_sort_field or body.sell_sort_desc != prev.sell_sort_desc:
+            raise HTTPException(status_code=403, detail="开售已开始，无法修改子账号售卖顺序")
     new_pw = (body.password or "").strip()
     if not new_pw:
         if prev and prev.password:
@@ -309,6 +313,8 @@ async def save_config(
         sell_start_time=new_sell or "",
         sold_son_ids_json=(prev.sold_son_ids_json if prev else None) or "{}",
         listing_amounts_json=(prev.listing_amounts_json if prev else None) or "{}",
+        sell_sort_field=body.sell_sort_field,
+        sell_sort_desc=body.sell_sort_desc,
     )
     await persist_trading_config(db, user.id, st.config)
     c = st.config
@@ -322,6 +328,8 @@ async def save_config(
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
         sell_start_time=c.sell_start_time or "",
+        sell_sort_field=c.sell_sort_field,
+        sell_sort_desc=c.sell_sort_desc,
         listing_amounts=listing_amounts_for_api(c),
     )
 
@@ -343,6 +351,8 @@ async def get_config(user: User = Depends(require_active_subscription), db: Asyn
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
         sell_start_time=c.sell_start_time or "",
+        sell_sort_field=c.sell_sort_field,
+        sell_sort_desc=c.sell_sort_desc,
         listing_amounts=listing_amounts_for_api(c),
     )
 
@@ -410,16 +420,23 @@ async def get_run_params(user: User = Depends(require_active_subscription), db: 
             run_period_start="",
             run_period_end="",
             sell_start_time="12:00",
+            sell_sort_field="create_time",
+            sell_sort_desc=False,
         )
     ri = int(row.request_interval_ms or 1000)
     if ri < 500:
         ri = 500
+    ssf = (getattr(row, "sell_sort_field", None) or "create_time").strip()
+    if ssf not in ("create_time", "ace_amount"):
+        ssf = "create_time"
     return RunParamsOut(
         quantity_start_limit=int(row.quantity_start_limit or 0),
         request_interval_ms=ri,
         run_period_start=row.run_period_start or "",
         run_period_end=row.run_period_end or "",
         sell_start_time=(getattr(row, "sell_start_time", None) or "") or "",
+        sell_sort_field=ssf,
+        sell_sort_desc=bool(getattr(row, "sell_sort_desc", False)),
     )
 
 
@@ -437,6 +454,11 @@ async def patch_run_params(
             detail="请先使用「保存配置」保存一次交易端配置，再保存运行参数",
         )
     prev = st.config
+    new_sf = body.sell_sort_field if body.sell_sort_field is not None else prev.sell_sort_field
+    new_sd = prev.sell_sort_desc if body.sell_sort_desc is None else body.sell_sort_desc
+    if subaccount_controls_locked(st):
+        if new_sf != prev.sell_sort_field or new_sd != prev.sell_sort_desc:
+            raise HTTPException(status_code=403, detail="开售已开始，无法修改子账号售卖顺序")
     st.config = prev.model_copy(
         update={
             "quantity_start_limit": body.quantity_start_limit,
@@ -444,6 +466,8 @@ async def patch_run_params(
             "run_period_start": body.run_period_start,
             "run_period_end": body.run_period_end,
             "sell_start_time": body.sell_start_time or "",
+            "sell_sort_field": new_sf,
+            "sell_sort_desc": new_sd,
         }
     )
     await persist_trading_config(db, user.id, st.config)
@@ -454,6 +478,8 @@ async def patch_run_params(
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
         sell_start_time=c.sell_start_time or "",
+        sell_sort_field=c.sell_sort_field,
+        sell_sort_desc=c.sell_sort_desc,
     )
 
 
@@ -599,6 +625,8 @@ async def refresh_subaccounts(
     st = await get_or_create_state(user.id)
     if not await ensure_trading_config_loaded(db, user.id, st):
         raise HTTPException(status_code=400, detail="请先保存交易配置")
+    if subaccount_controls_locked(st):
+        raise HTTPException(status_code=403, detail="开售已开始，禁止刷新子账号")
     cfg = st.config
     if cfg is None:
         raise HTTPException(status_code=400, detail="请先保存交易配置")
@@ -690,6 +718,7 @@ async def run_status(user: User = Depends(require_active_subscription), db: Asyn
         window_samples=nwin,
         timed_sell_internal_only_today=tio,
         timed_sell_would_skip_outbound_if_started=tws,
+        subaccount_controls_locked=subaccount_controls_locked(st),
     )
 
 
@@ -714,6 +743,7 @@ async def run_start(
             window_samples=nwin,
             timed_sell_internal_only_today=tio,
             timed_sell_would_skip_outbound_if_started=tws,
+            subaccount_controls_locked=subaccount_controls_locked(st),
         )
 
     cfg = st.config
@@ -723,6 +753,7 @@ async def run_start(
     await persist_trading_config(db, user.id, st.config)
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
+    st.hot_sell_session_started = False
     _apply_timed_sell_late_start_skip_flag(st, st.config)
     st.runner_task = asyncio.create_task(run_background(user.id, st.config))
     fl = get_floor_controller(user.id)
@@ -737,6 +768,7 @@ async def run_start(
         window_samples=nwin,
         timed_sell_internal_only_today=tio,
         timed_sell_would_skip_outbound_if_started=tws,
+        subaccount_controls_locked=subaccount_controls_locked(st),
     )
 
 
@@ -755,6 +787,7 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
         except asyncio.CancelledError:
             pass
     st.runner_task = None
+    st.hot_sell_session_started = False
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
     tio, tws = _run_status_timed_sell_flags(st)
@@ -767,6 +800,7 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
         window_samples=nwin,
         timed_sell_internal_only_today=tio,
         timed_sell_would_skip_outbound_if_started=tws,
+        subaccount_controls_locked=subaccount_controls_locked(st),
     )
 
 

@@ -57,6 +57,14 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE trading_configs ADD COLUMN listing_amounts_json TEXT DEFAULT '{}'"
                 )
+            if "sell_sort_field" not in cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE trading_configs ADD COLUMN sell_sort_field VARCHAR(32) DEFAULT 'create_time'"
+                )
+            if "sell_sort_desc" not in cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE trading_configs ADD COLUMN sell_sort_desc INTEGER DEFAULT 0"
+                )
 
             urows = (await conn.exec_driver_sql("PRAGMA table_info(users)")).fetchall()
             ucols = {str(r[1]) for r in urows}
