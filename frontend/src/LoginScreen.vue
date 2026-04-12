@@ -99,6 +99,12 @@ async function submit() {
         >
           {{ isRegister ? "已有账号？去登录" : "没有账号？注册" }}
         </button>
+        <a
+          href="#/contact"
+          class="mt-3 block w-full text-center text-xs text-zinc-500 underline decoration-zinc-600 underline-offset-2 hover:text-violet-400/90"
+        >
+          没有账号？找我领取
+        </a>
       </div>
 
       <p class="mt-6 text-center text-xs text-zinc-600">

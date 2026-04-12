@@ -1,6 +1,7 @@
 <script setup>
 import { onMounted, onUnmounted, ref } from "vue";
 import AdminPanel from "./AdminPanel.vue";
+import ContactPage from "./ContactPage.vue";
 import ConsolePanel from "./ConsolePanel.vue";
 import LoginScreen from "./LoginScreen.vue";
 
@@ -14,10 +15,18 @@ function adminHash() {
   return h === "#/admin" || h === "#admin";
 }
 
+function contactHash() {
+  if (typeof window === "undefined") return false;
+  const h = (window.location.hash || "").toLowerCase();
+  return h === "#/contact" || h === "#contact";
+}
+
 const isAdminView = ref(adminHash());
+const isContactView = ref(contactHash());
 
 function onHashChange() {
   isAdminView.value = adminHash();
+  isContactView.value = contactHash();
 }
 
 onMounted(() => {
@@ -41,8 +50,11 @@ function logout() {
 
 <template>
   <AdminPanel v-if="isAdminView" />
+  <template v-else-if="token">
+    <ConsolePanel :token="token" @logout="logout" />
+  </template>
   <template v-else>
-    <LoginScreen v-if="!token" @logged-in="onLoggedIn" />
-    <ConsolePanel v-else :token="token" @logout="logout" />
+    <ContactPage v-if="isContactView" />
+    <LoginScreen v-else @logged-in="onLoggedIn" />
   </template>
 </template>
