@@ -11,6 +11,27 @@ const isRegister = ref(false);
 /** null=加载中；false=关闭自助注册，隐藏入口 */
 const registrationOpen = ref(null);
 
+const captchaRequired = ref(false);
+const captchaId = ref("");
+const captchaQuestion = ref("");
+const captchaAnswer = ref("");
+
+function applyCaptchaFromResponse(j) {
+  if (j && j.captcha_required) {
+    captchaRequired.value = true;
+    if (j.captcha_id) captchaId.value = j.captcha_id;
+    if (j.captcha_question) captchaQuestion.value = j.captcha_question;
+    captchaAnswer.value = "";
+  }
+}
+
+function clearCaptcha() {
+  captchaRequired.value = false;
+  captchaId.value = "";
+  captchaQuestion.value = "";
+  captchaAnswer.value = "";
+}
+
 onMounted(async () => {
   try {
     const r = await fetch("/api/auth/site-info");
@@ -29,6 +50,10 @@ watch(registrationOpen, (v) => {
   if (v === false) isRegister.value = false;
 });
 
+watch(isRegister, (reg) => {
+  if (reg) clearCaptcha();
+});
+
 async function submit() {
   err.value = "";
   if (isRegister.value && registrationOpen.value === false) {
@@ -38,16 +63,22 @@ async function submit() {
   loading.value = true;
   try {
     const path = isRegister.value ? "/api/auth/register" : "/api/auth/token";
+    const payload = {
+      username: username.value.trim(),
+      password: password.value,
+    };
+    if (!isRegister.value && captchaRequired.value && captchaId.value) {
+      payload.captcha_id = captchaId.value;
+      payload.captcha_answer = captchaAnswer.value.trim();
+    }
     const r = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: username.value.trim(),
-        password: password.value,
-      }),
+      body: JSON.stringify(payload),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) {
+      applyCaptchaFromResponse(j);
       const d = j.detail;
       if (typeof d === "string") err.value = d;
       else if (Array.isArray(d)) err.value = d.map((x) => x.msg || String(x)).join("；");
@@ -57,10 +88,12 @@ async function submit() {
     }
     if (isRegister.value) {
       isRegister.value = false;
+      clearCaptcha();
       err.value = "注册成功，请登录";
       loading.value = false;
       return;
     }
+    clearCaptcha();
     emit("logged-in", j.access_token);
   } catch {
     err.value = "网络错误";
@@ -111,6 +144,21 @@ async function submit() {
           placeholder="请输入密码"
           @keyup.enter="submit"
         />
+        <template v-if="captchaRequired && !isRegister">
+          <label class="mb-1 block text-sm text-amber-200/90">验证码</label>
+          <p class="mb-2 font-mono text-sm text-zinc-300">
+            请计算：<span class="text-amber-300/90">{{ captchaQuestion || "—" }}</span> = ?
+          </p>
+          <input
+            v-model="captchaAnswer"
+            type="text"
+            inputmode="numeric"
+            autocomplete="off"
+            class="mb-2 w-full rounded-lg border border-amber-900/40 bg-black/50 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-amber-500/50 focus:ring-2"
+            placeholder="填写计算结果"
+            @keyup.enter="submit"
+          />
+        </template>
         <p v-if="err" class="mb-3 text-xs text-amber-400/90">{{ err }}</p>
         <button
           type="button"

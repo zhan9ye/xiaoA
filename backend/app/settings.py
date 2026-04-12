@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     admin_password_hash: str = ""
     admin_jwt_expire_hours: int = 8
     registration_open: bool = True
+    # 同一 IP 登录失败达到此次数后，须先通过算术验证码再验密码（内存计数，多 worker 各算各的）
+    login_captcha_after_failures: int = 3
+    login_captcha_ttl_seconds: int = 300
     # 新注册用户试用天数（从注册时刻起算 subscription_end_at）；0 表示注册后无时长须积分兑换
     new_user_trial_days: int = 0
     # 为已有账号迁移时：subscription_end_at 为空则补齐到「当前 UTC + 该天数」（仅 SQLite 迁移执行一次）

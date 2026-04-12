@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +70,14 @@ from app.services.credits_service import (
     subscription_expired,
 )
 from app.services.global_floor import get_floor_controller
+from app.services.login_bruteforce import (
+    clear_login_failures,
+    client_ip,
+    create_login_captcha,
+    needs_login_captcha,
+    record_login_failure,
+    verify_login_captcha,
+)
 from app.services.selling_eligibility import (
     effective_listing_amount_str,
     enrich_subaccounts_with_listing_qty,
@@ -209,12 +218,54 @@ async def register(body: UserRegisterIn, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/auth/token", response_model=TokenOut)
-async def login_token(body: UserLoginIn, db: AsyncSession = Depends(get_db)):
+async def login_token(request: Request, body: UserLoginIn, db: AsyncSession = Depends(get_db)):
+    ip = client_ip(request)
+
+    if await needs_login_captcha(ip):
+        cid_req = (body.captcha_id or "").strip()
+        ans_req = (body.captcha_answer or "").strip()
+        if not cid_req or not ans_req:
+            c_id, c_q = await create_login_captcha()
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "登录失败次数过多，请填写验证码",
+                    "captcha_required": True,
+                    "captcha_id": c_id,
+                    "captcha_question": c_q,
+                },
+            )
+        if not await verify_login_captcha(cid_req, ans_req):
+            c_id, c_q = await create_login_captcha()
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "验证码错误或已过期",
+                    "captcha_required": True,
+                    "captcha_id": c_id,
+                    "captcha_question": c_q,
+                },
+            )
+
     name = body.username.strip()
     result = await db.execute(select(User).where(User.username == name))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(body.password, user.password_hash):
+        await record_login_failure(ip)
+        if await needs_login_captcha(ip):
+            c_id, c_q = await create_login_captcha()
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "账号或密码错误",
+                    "captcha_required": True,
+                    "captcha_id": c_id,
+                    "captcha_question": c_q,
+                },
+            )
         raise HTTPException(status_code=401, detail="账号或密码错误")
+
+    await clear_login_failures(ip)
     token = create_access_token(user.id)
     return TokenOut(access_token=token)
 

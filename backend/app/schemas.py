@@ -368,6 +368,8 @@ class UserRegisterIn(BaseModel):
 class UserLoginIn(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
+    captcha_id: Optional[str] = Field(default=None, description="登录失败达阈值后，由接口返回的验证码 id")
+    captcha_answer: Optional[str] = Field(default=None, description="验证码答案（算术题结果）")
 
 
 class TokenOut(BaseModel):
