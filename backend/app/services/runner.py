@@ -714,9 +714,10 @@ async def _hot_window_sell_session(
                             grace_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
                             if not logged_grace_for_son:
                                 logged_grace_for_son = True
+                                sub_grace = resolve_subaccount_display_name(row) or son_id
                                 await log_hub.push(
                                     LogLevel.warn,
-                                    f"sonId={son_id} 通道尚未开放，信任窗口内短间隔重试（约 {grace_ms}ms）",
+                                    f"子账户：{sub_grace}，售卖失败，通道尚未开放！",
                                 )
                             if grace_ms > 0 and attempt < max_attempts:
                                 await _sleep_between_sell_requests(state, grace_ms)
