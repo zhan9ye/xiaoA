@@ -19,6 +19,9 @@ const poolErr = ref("");
 const poolLoading = ref(false);
 const proxyForm = ref({ label: "", proxy_url: "" });
 
+const createUserForm = ref({ username: "", password: "" });
+const createUserBusy = ref(false);
+
 const pwdModal = ref({ open: false, userId: null, username: "", value: "" });
 const ptsModal = ref({ open: false, userId: null, username: "", value: "" });
 const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "" });
@@ -92,6 +95,49 @@ async function loadProxyPool() {
     poolErr.value = "网络错误";
   } finally {
     poolLoading.value = false;
+  }
+}
+
+async function submitCreateUser() {
+  actionMsg.value = "";
+  const u = createUserForm.value.username.trim();
+  const p = createUserForm.value.password;
+  if (u.length < 2) {
+    actionMsg.value = "用户名至少 2 个字符";
+    return;
+  }
+  if (p.length < 6) {
+    actionMsg.value = "密码至少 6 位";
+    return;
+  }
+  createUserBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ username: u, password: p }),
+    });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const d = j.detail;
+      if (typeof d === "string") actionMsg.value = d;
+      else if (Array.isArray(d))
+        actionMsg.value = d.map((x) => x.msg || String(x)).join("；");
+      else actionMsg.value = "创建失败";
+      return;
+    }
+    createUserForm.value = { username: "", password: "" };
+    await loadUsers();
+    actionMsg.value = `已创建用户 #${j.id}「${j.username || u}」`;
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    createUserBusy.value = false;
   }
 }
 
@@ -542,6 +588,40 @@ onMounted(() => {
         </div>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">平台用户</h2>
+        <p class="mb-3 text-xs text-zinc-500">
+          创建账号不受前台「注册开关」限制；试用时长与 <code class="text-zinc-400">NEW_USER_TRIAL_DAYS</code> 一致（为 0 则订阅为未开通）。
+        </p>
+        <div class="mb-4 flex flex-wrap items-end gap-2 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+          <div class="min-w-[140px] flex-1 sm:max-w-xs">
+            <label class="mb-1 block text-xs text-zinc-500">新用户名</label>
+            <input
+              v-model="createUserForm.username"
+              type="text"
+              autocomplete="off"
+              class="w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-1.5 text-sm outline-none ring-rose-500/40 focus:ring-2"
+              placeholder="2–64 字符"
+            />
+          </div>
+          <div class="min-w-[140px] flex-1 sm:max-w-xs">
+            <label class="mb-1 block text-xs text-zinc-500">初始密码</label>
+            <input
+              v-model="createUserForm.password"
+              type="password"
+              autocomplete="new-password"
+              class="w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-1.5 text-sm outline-none ring-rose-500/40 focus:ring-2"
+              placeholder="≥6 位"
+              @keyup.enter="submitCreateUser"
+            />
+          </div>
+          <button
+            type="button"
+            class="rounded-lg border border-emerald-800/60 bg-emerald-950/50 px-4 py-2 text-sm text-emerald-200 hover:bg-emerald-950/80 disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="createUserBusy"
+            @click="submitCreateUser"
+          >
+            {{ createUserBusy ? "创建中…" : "创建账号" }}
+          </button>
+        </div>
         <div class="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/40">
           <table class="w-full min-w-[880px] border-collapse text-left text-xs">
             <thead>

@@ -440,6 +440,13 @@ class AdminUserListOut(BaseModel):
     users: List[AdminUserRow]
 
 
+class AdminCreateUserIn(BaseModel):
+    """管理员创建平台用户（不受 registration_open 限制；试用天数与公开注册一致）。"""
+
+    username: str = Field(..., min_length=2, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+
+
 class AdminSetPasswordIn(BaseModel):
     new_password: str = Field(..., min_length=6, max_length=128)
 

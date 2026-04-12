@@ -1,4 +1,5 @@
 import hmac
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -12,6 +13,7 @@ from app.db import get_db
 from app.deps_admin import is_admin_auth_configured, require_admin
 from app.models import ProxyPoolEntry, User
 from app.schemas import (
+    AdminCreateUserIn,
     AdminLoginIn,
     AdminProxyPoolAddIn,
     AdminProxyPoolListOut,
@@ -24,6 +26,7 @@ from app.schemas import (
     AdminUserListOut,
     AdminUserProxyIn,
     AdminUserRow,
+    UserPublic,
 )
 from app.services.session_manager import normalize_proxy_url
 from app.settings import settings
@@ -216,6 +219,36 @@ async def admin_list_users(
             )
         )
     return AdminUserListOut(users=users_out)
+
+
+@router.post("/users", response_model=UserPublic)
+async def admin_create_user(
+    body: AdminCreateUserIn,
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserPublic:
+    """创建平台用户；规则与公开注册一致（试用天数 NEW_USER_TRIAL_DAYS），但不检查 registration_open。"""
+    name = body.username.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="用户名不能为空")
+    result = await db.execute(select(User).where(User.username == name))
+    if result.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    trial = max(0, int(settings.new_user_trial_days or 0))
+    sub_end = None
+    if trial > 0:
+        sub_end = datetime.now(timezone.utc) + timedelta(days=trial)
+    user = User(
+        username=name,
+        password_hash=hash_password(body.password),
+        is_disabled=False,
+        points_balance=0,
+        subscription_end_at=sub_end,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return UserPublic(id=user.id, username=user.username)
 
 
 @router.patch("/users/{user_id}/disabled")
