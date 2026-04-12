@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 from app.schemas import AppConfigIn
-from app.services.ace_sell_son_service import describe_ace_sell_response, post_ace_sell_son
+from app.services.ace_sell_son_service import post_ace_sell_son
 from app.services.beijing_time import (
     BJ,
     beijing_now,
@@ -28,6 +28,7 @@ from app.services.selling_eligibility import (
     ace_amount_string_for_rpc,
     effective_listing_amount_str,
     resolve_son_id,
+    resolve_subaccount_display_name,
     subaccount_eligible_for_ace_sell,
 )
 from app.services.sold_son_store import add_sold_son_json, sold_son_ids_for_today
@@ -120,10 +121,6 @@ async def _refresh_sell_mnemonic_cache(
     state.sell_mnemonic_id1 = mid1
     state.sell_mnemonic_key = mkey
     state.sell_mnemonic_str1 = mstr
-    await log_hub.push(
-        LogLevel.success,
-        "Mnemonic_Get01 已拉取并缓存（本轮售卖共用 mnemonicid1/mnemonickey/mnemonicstr1，不再重复请求）",
-    )
     return True
 
 
@@ -460,10 +457,6 @@ async def _timed_prep_phase(
 
         items = sub_out.items
         state.subaccounts_cache = list(items)
-        await log_hub.push(
-            LogLevel.success,
-            f"开售前准备：子账号列表已全量拉取，共 {len(items)} 条（尝试 {attempt}/{max_attempts}）",
-        )
         if not await _refresh_sell_mnemonic_cache(state, sm, log_hub, cfg):
             await log_hub.push(LogLevel.error, "准备阶段：子账号已拉取但 Mnemonic_Get01 失败")
             return False, [], cfg, rk, uid
@@ -490,7 +483,6 @@ async def _sell_open_warmup_loop(
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=BJ)
     first_at = start_dt - timedelta(seconds=before)
-    logged_start = False
     while not state.stop_event.is_set():
         now = beijing_now()
         if now >= start_dt:
@@ -509,12 +501,6 @@ async def _sell_open_warmup_loop(
         ok, code, _parsed, _raw = await post_mnemonic_get01(
             sm, rpc_key=rk, user_id=uid, v=v, lang="cn"
         )
-        if not logged_start:
-            await log_hub.push(
-                LogLevel.info,
-                f"开售连接预热：Mnemonic_Get01 保活（至整点前，间隔约 {ping_sec:.0f}s）",
-            )
-            logged_start = True
         if not ok:
             await log_hub.push(
                 LogLevel.warn,
@@ -578,7 +564,7 @@ async def _hot_window_sell_session(
 
         await log_hub.push(
             LogLevel.info,
-            f"售卖轮次：本轮待处理 {len(remaining_rows)} 个子账号（ACE 并发 {concurrency}）",
+            f"售卖轮次：本轮待处理 {len(remaining_rows)} 个子账号",
         )
 
         rk0 = cfg.rpc_login_key.strip()
@@ -634,7 +620,8 @@ async def _hot_window_sell_session(
                     else None
                 )
                 in_grace = grace_deadline is not None and beijing_now() < grace_deadline
-                max_attempts = 100 if in_grace else 3
+                # 信任窗口内仅对「通道尚未开放」文案密集重试；其余失败（429/超时/业务错等）单本子账号只打一发即进入下一子账户
+                max_attempts = 100 if in_grace else 1
                 logged_grace_for_son = False
                 for attempt in range(1, max_attempts + 1):
                     if channel_ev.is_set() or relogin_ev.is_set() or state.stop_event.is_set():
@@ -714,32 +701,43 @@ async def _hot_window_sell_session(
                             state.last_runner_error = "ACE_Sell_Son 未登錄"
                         return
 
-                    detail = describe_ace_sell_response(code_s, parsed, raw_out)
                     json_err = isinstance(parsed, dict) and parsed.get("Error") is True
                     rate_limited = is_429
 
                     if ok_s and not json_err and not rate_limited:
+                        sub_ok = resolve_subaccount_display_name(row) or son_id
                         await log_hub.push(
                             LogLevel.success,
-                            f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {detail}".strip()[:2600],
+                            f"恭喜子账户：{sub_ok}，售卖成功！售卖数量：{cnt}",
                         )
                         biz_success = True
                         break
                     if rate_limited:
+                        sub_name = resolve_subaccount_display_name(row) or son_id
                         await log_hub.push(
                             LogLevel.warn,
-                            f"ACE_Sell_Son sonId={son_id} HTTP 429 限流：{detail}".strip()[:2600],
+                            f"子账号：{sub_name}，售卖失败，限流！",
                         )
-                    else:
-                        tag = "业务失败(Error=true)" if json_err else "请求失败"
+                    elif json_err:
+                        sub_name = resolve_subaccount_display_name(row) or son_id
                         await log_hub.push(
                             LogLevel.error,
-                            f"ACE_Sell_Son sonId={son_id} HTTP {code_s} {tag}：{detail}".strip()[:2600],
+                            f"子账号：{sub_name}，售卖失败，参数不正确！",
+                        )
+                    elif code_s == 0:
+                        sub_name = resolve_subaccount_display_name(row) or son_id
+                        await log_hub.push(
+                            LogLevel.error,
+                            f"子账号：{sub_name}，售卖失败，服务器没有响应！",
+                        )
+                    else:
+                        sub_name = resolve_subaccount_display_name(row) or son_id
+                        await log_hub.push(
+                            LogLevel.error,
+                            f"子账户：{sub_name}，售卖失败，服务器忙！",
                         )
 
-                    eff = _user_sell_interval_ms(cfg_row)
-                    if attempt < max_attempts:
-                        await _sleep_between_sell_requests(state, eff)
+                    break
 
                 if biz_success:
                     async with cfg_lock:
@@ -762,10 +760,6 @@ async def _hot_window_sell_session(
             if sell_start_beijing is not None:
                 pre_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
                 if pre_ms > 0:
-                    await log_hub.push(
-                        LogLevel.info,
-                        f"定时开售：首批 ACE 前等待 {pre_ms}ms（与 SELL_CHANNEL_CLOSED_GRACE_RETRY_MS 一致）",
-                    )
                     await _sleep_between_sell_requests(state, pre_ms)
 
         results = await asyncio.gather(
@@ -820,10 +814,6 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                     state.runner_late_start_skip_outbound_today = ""
                     late_raw = ""
                 if late_raw == today_bj:
-                    await log_hub.push(
-                        LogLevel.warn,
-                        "本日因启动时间晚于开售缓冲，不调用登录/子账号/助记词/售卖；仅内部等待至北京次日。",
-                    )
                     state.last_runner_error = "已超过开售缓冲时间，本日不执行对外售卖链路"
                     sec = seconds_until_next_beijing_midnight()
                     await log_hub.push(
@@ -927,10 +917,6 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                         state.runner_must_refresh_trading_cache = False
 
                         if beijing_now() < start_dt:
-                            await log_hub.push(
-                                LogLevel.info,
-                                "WaitOpen：等待开售整点（与连接预热并行，北京时间分段对齐）",
-                            )
                             await asyncio.gather(
                                 wait_open_phases_beijing(
                                     state.stop_event,

@@ -343,7 +343,7 @@ class CreditsOverviewOut(BaseModel):
 
 
 class RedeemDaysIn(BaseModel):
-    days: int = Field(..., description="套餐天数：1 / 7 / 30 / 90 / 180 / 360")
+    days: int = Field(..., description="套餐天数：7 / 30 / 90 / 180 / 360")
 
     @field_validator("days")
     @classmethod

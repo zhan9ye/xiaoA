@@ -21,6 +21,26 @@ def resolve_son_id(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def resolve_subaccount_display_name(row: Dict[str, Any]) -> str:
+    """子账号展示名（与前端「子账户名」MemberNo 等一致）；无则返回空串。"""
+    for k in (
+        "MemberNo",
+        "memberNo",
+        "MemberNO",
+        "SonName",
+        "sonName",
+        "UserName",
+        "username",
+        "NickName",
+        "Name",
+        "AccountName",
+    ):
+        v = row.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def ace_amount_string_for_rpc(row: Dict[str, Any]) -> str:
     """子账号 AceAmount 格式化为 RPC 字符串（amount/count）。"""
     v = _parse_ace_amount(row)
