@@ -13,7 +13,7 @@ from app.models import User
 # 天数 -> 所需积分
 CREDIT_PACKAGES: Dict[int, int] = {
     7: 1000,
-    30: 3500,
+    30: 3000,
     90: 9000,
     180: 16000,
     360: 28000,

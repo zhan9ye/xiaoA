@@ -66,8 +66,7 @@ watch([sellHourSel, sellMinuteSel], () => {
 });
 const runPeriodStart = ref("");
 const runPeriodEnd = ref("");
-/** 来自 /api/run/status：全站 floor 与 SR₄₂₉ 窗口 */
-const floorCurrMs = ref(50);
+/** 来自 /api/run/status：SR₄₂₉ 窗口 */
 const sr429Window = ref(null);
 const windowSamples = ref(0);
 const displayName = ref("");
@@ -1041,7 +1040,6 @@ async function refreshStatus() {
       timedSellInternalOnlyToday.value = !!j.timed_sell_internal_only_today;
       timedSellWouldSkipOutboundIfStarted.value = !!j.timed_sell_would_skip_outbound_if_started;
       subaccountControlsLocked.value = !!j.subaccount_controls_locked;
-      if (j.floor_curr_ms != null) floorCurrMs.value = Number(j.floor_curr_ms);
       sr429Window.value = j.sr429_window != null && j.sr429_window !== undefined ? Number(j.sr429_window) : null;
       windowSamples.value = j.window_samples != null ? Number(j.window_samples) : 0;
     }
@@ -1440,8 +1438,6 @@ onMounted(async () => {
                 <span class="text-zinc-600">·</span>
                 <span class="text-amber-400/90">已过开售缓冲，点开始将仅等到次日</span>
               </template>
-              <span class="text-zinc-600">·</span>
-              <span>floor {{ floorCurrMs }}ms</span>
               <template v-if="sr429Window != null && windowSamples >= 100">
                 <span class="text-zinc-600">·</span>
                 <span class="font-mono text-zinc-400">
