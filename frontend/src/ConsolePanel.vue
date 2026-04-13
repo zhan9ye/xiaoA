@@ -1859,7 +1859,7 @@ onMounted(async () => {
   <Teleport to="body">
     <div
       v-if="toastVisible"
-      class="pointer-events-none fixed bottom-6 left-1/2 z-[500] -translate-x-1/2 px-4"
+      class="pointer-events-none fixed left-1/2 top-6 z-[500] -translate-x-1/2 px-4"
       role="status"
       aria-live="polite"
     >
