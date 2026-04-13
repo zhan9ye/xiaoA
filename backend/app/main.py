@@ -438,7 +438,7 @@ async def patch_listing_amount(
     user: User = Depends(require_active_subscription),
     db: AsyncSession = Depends(get_db),
 ):
-    """设置单个子账号挂售数量；amount 为空则恢复为全部股数。写入数据库并更新内存中的 trading config。"""
+    """设置单个子账号挂售数量；amount 为空则清除覆盖（挂售全部）；「0」表示不卖。写入数据库并更新内存。"""
     st = await get_or_create_state(user.id)
     if not await ensure_trading_config_loaded(db, user.id, st) or st.config is None:
         raise HTTPException(status_code=400, detail="请先保存交易配置")
@@ -460,22 +460,22 @@ async def patch_listing_amount(
         if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", amt):
             raise HTTPException(status_code=400, detail="挂售数量须为数字")
         try:
-            if float(amt) <= 0:
-                raise HTTPException(status_code=400, detail="挂售数量须大于 0")
-        except HTTPException:
-            raise
+            amt_f = float(amt)
         except ValueError:
             raise HTTPException(status_code=400, detail="挂售数量须为有效数字")
-        full = resolve_count_from_subaccounts(list(st.subaccounts_cache or []), sid)
-        if full:
-            try:
-                full_n = float(str(full).replace(",", "").strip())
-                if float(amt) > full_n + 1e-9:
-                    raise HTTPException(status_code=400, detail="挂售数量不能大于当前股数")
-            except HTTPException:
-                raise
-            except ValueError:
-                pass
+        if amt_f < 0:
+            raise HTTPException(status_code=400, detail="挂售数量须为有效数字")
+        if amt_f > 0:
+            full = resolve_count_from_subaccounts(list(st.subaccounts_cache or []), sid)
+            if full:
+                try:
+                    full_n = float(str(full).replace(",", "").strip())
+                    if amt_f > full_n + 1e-9:
+                        raise HTTPException(status_code=400, detail="挂售数量不能大于当前股数")
+                except HTTPException:
+                    raise
+                except ValueError:
+                    pass
         m[sid] = amt
     new_json = json.dumps(m, ensure_ascii=False, separators=(",", ":"))
     new_cfg = cfg.model_copy(update={"listing_amounts_json": new_json})

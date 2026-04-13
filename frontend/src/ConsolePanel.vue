@@ -294,7 +294,11 @@ function listingAmountDisplay(row) {
   const full = aceAmountStringForRow(row);
   if (!sid || !full) return "—";
   const o = listingAmountsMap.value[sid];
-  if (o != null && String(o).trim() !== "") return String(o).trim();
+  if (o != null && String(o).trim() !== "") {
+    const t = String(o).trim();
+    if (t === "0") return "不卖";
+    return t;
+  }
   return full;
 }
 
@@ -313,31 +317,21 @@ function closeListingEdit() {
   listingEditOpen.value = false;
 }
 
-async function submitListingEdit() {
+/** 全部股数 → 卖一半：⌊全部/2⌋+1（与产品约定一致） */
+function halfListingAmountFromFull(fullRaw) {
+  const full = parseFloat(String(fullRaw).replaceAll(",", "").trim());
+  if (!Number.isFinite(full) || full <= 0) return null;
+  const half = Math.floor(full / 2) + 1;
+  if (!Number.isFinite(half) || half <= 0) return null;
+  if (Number.isFinite(full) && half > full + 1e-9) return String(Math.floor(full) === full ? Math.floor(full) : full);
+  if (half === Math.floor(half)) return String(Math.floor(half));
+  return String(half);
+}
+
+async function patchListingAmount(amountPayload) {
   listingEditErr.value = "";
   const sid = listingEditSonId.value;
-  const full = String(listingEditFullShares.value).replaceAll(",", "").trim();
-  const raw = String(listingEditInput.value).replaceAll(",", "").trim();
-  if (!raw) {
-    listingEditErr.value = "请输入挂售数量，或点「恢复全部股数」";
-    return;
-  }
-  if (!/^[0-9]+(\.[0-9]+)?$/.test(raw)) {
-    listingEditErr.value = "须为数字";
-    return;
-  }
-  const num = parseFloat(raw);
-  const fullNum = parseFloat(full);
-  if (!(num > 0)) {
-    listingEditErr.value = "须大于 0";
-    return;
-  }
-  if (Number.isFinite(fullNum) && num > fullNum + 1e-9) {
-    listingEditErr.value = "不能大于当前股数";
-    return;
-  }
-  const sameAsFull = Number.isFinite(fullNum) && Math.abs(num - fullNum) < 1e-9;
-  const amountPayload = sameAsFull ? "" : raw;
+  if (!sid) return;
   listingEditBusy.value = true;
   try {
     const r = await fetch("/api/config/listing-amount", {
@@ -373,41 +367,42 @@ async function submitListingEdit() {
   }
 }
 
-async function resetListingToFullShares() {
+async function applyListingHalf() {
+  const halfStr = halfListingAmountFromFull(listingEditFullShares.value);
+  if (halfStr == null) {
+    listingEditErr.value = "无法根据当前股数计算卖一半";
+    return;
+  }
+  listingEditInput.value = halfStr;
+  await patchListingAmount(halfStr);
+}
+
+async function submitListingEdit() {
   listingEditErr.value = "";
   const sid = listingEditSonId.value;
-  if (!sid) return;
-  listingEditBusy.value = true;
-  try {
-    const r = await fetch("/api/config/listing-amount", {
-      method: "PATCH",
-      headers: headers(),
-      body: JSON.stringify({ son_id: sid, amount: "" }),
-    });
-    if (r.status === 401) {
-      emit("logout");
-      return;
-    }
-    if (!r.ok) {
-      try {
-        const err = await r.json();
-        listingEditErr.value = typeof err.detail === "string" ? err.detail : "恢复失败";
-      } catch {
-        listingEditErr.value = "恢复失败";
-      }
-      return;
-    }
-    const j = await r.json();
-    if (j.listing_amounts && typeof j.listing_amounts === "object") {
-      listingAmountsMap.value = { ...j.listing_amounts };
-    }
-    await loadSubaccounts();
-    listingEditOpen.value = false;
-  } catch {
-    listingEditErr.value = "网络错误";
-  } finally {
-    listingEditBusy.value = false;
+  const full = String(listingEditFullShares.value).replaceAll(",", "").trim();
+  const raw = String(listingEditInput.value).replaceAll(",", "").trim();
+  if (!raw) {
+    await patchListingAmount("");
+    return;
   }
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(raw)) {
+    listingEditErr.value = "须为数字";
+    return;
+  }
+  const num = parseFloat(raw);
+  const fullNum = parseFloat(full);
+  if (num < 0 || !Number.isFinite(num)) {
+    listingEditErr.value = "须为有效数字";
+    return;
+  }
+  if (num > 0 && Number.isFinite(fullNum) && num > fullNum + 1e-9) {
+    listingEditErr.value = "不能大于当前股数";
+    return;
+  }
+  const sameAsFull = num > 0 && Number.isFinite(fullNum) && Math.abs(num - fullNum) < 1e-9;
+  const amountPayload = sameAsFull ? "" : num === 0 ? "0" : raw;
+  await patchListingAmount(amountPayload);
 }
 
 function parseCreatedDay(row) {
@@ -1229,14 +1224,6 @@ onBeforeUnmount(() => {
             min="0"
             class="mb-3 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
           />
-          <label class="mb-1 block text-xs text-zinc-500">请求间隔（毫秒，≥1000）</label>
-          <input
-            v-model.number="requestIntervalMs"
-            type="number"
-            min="1000"
-            step="50"
-            class="mb-3 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-          />
           <button
             type="button"
             class="mb-3 w-full rounded-lg border border-emerald-700/80 bg-emerald-950/50 py-2.5 text-sm font-medium text-emerald-100 hover:bg-emerald-900/50"
@@ -1672,14 +1659,33 @@ onBeforeUnmount(() => {
           @keyup.enter="submitListingEdit"
         />
         <p v-if="listingEditErr" class="mb-2 text-xs text-amber-400/90">{{ listingEditErr }}</p>
-        <button
-          type="button"
-          class="mb-4 text-xs text-zinc-500 underline decoration-zinc-600 hover:text-zinc-300"
-          :disabled="listingEditBusy"
-          @click="resetListingToFullShares"
-        >
-          恢复为全部股数
-        </button>
+        <p class="mb-2 text-xs text-zinc-500">快捷设置</p>
+        <div class="mb-4 grid grid-cols-3 gap-2">
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 bg-zinc-800/80 px-2 py-2 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+            :disabled="listingEditBusy"
+            @click="patchListingAmount('0')"
+          >
+            不卖
+          </button>
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 bg-zinc-800/80 px-2 py-2 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+            :disabled="listingEditBusy"
+            @click="applyListingHalf"
+          >
+            卖一半
+          </button>
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 bg-zinc-800/80 px-2 py-2 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+            :disabled="listingEditBusy"
+            @click="patchListingAmount('')"
+          >
+            卖全部
+          </button>
+        </div>
         <div class="flex justify-end gap-2">
           <button
             type="button"

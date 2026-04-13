@@ -207,7 +207,7 @@ class ListingAmountPatchIn(BaseModel):
     son_id: str = Field(..., min_length=1, description="子账号 id，与 RPC sonId 一致")
     amount: str = Field(
         default="",
-        description="挂售数量；空字符串表示恢复为全部股数（清除该 sonId 的覆盖）",
+        description="挂售数量；空字符串表示恢复为全部股数（清除覆盖）；「0」表示不卖（写入覆盖，售卖层 cnt 为空）",
     )
 
 

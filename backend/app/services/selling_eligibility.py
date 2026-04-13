@@ -182,6 +182,7 @@ def effective_listing_amount_str(cfg: AppConfigIn, son_id: str, full_amount_str:
     """
     挂售数量：若配置中有该 sonId 的覆盖则用之，否则为全部股数（full_amount_str）。
     full_amount_str 须为 RPC 侧数量字符串（与 ace_amount_string_for_rpc 一致）。
+    覆盖为「0」表示不参与挂售（返回空，上层跳过 ACE_Sell_Son）。
     """
     if not full_amount_str:
         return ""
@@ -190,7 +191,13 @@ def effective_listing_amount_str(cfg: AppConfigIn, son_id: str, full_amount_str:
     v = m.get(sid)
     if v is None or v == "":
         return _normalize_amount_token(full_amount_str)
-    return _normalize_amount_token(v)
+    token = _normalize_amount_token(v)
+    try:
+        if float(token) <= 0:
+            return ""
+    except ValueError:
+        pass
+    return token
 
 
 def sort_subaccounts_for_sell(rows: List[Dict[str, Any]], cfg: AppConfigIn) -> List[Dict[str, Any]]:

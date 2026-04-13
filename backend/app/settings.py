@@ -33,9 +33,9 @@ class Settings(BaseSettings):
     subaccount_max_pages: int = 200
     # 运行任务每轮之间的等待秒数（登录 → 子账号 → Mnemonic_Get01 → ACE_Sell_Son 之后）
     runner_loop_interval_seconds: int = 10
-    # RPC 请求超时秒数（抢购建议设为 5-10，平时可设为 30）
+    # RPC 请求超时秒数（httpx）；亦为 HotWindow 两波售卖之间的固定间隔秒数
     rpc_timeout_seconds: float = 10.0
-    # HotWindow 并发数：同时处理多少个子账号的售卖（默认 1，抢购建议 3-5，过高易 429）
+    # HotWindow：每波并发多少路 ACE_Sell_Son（不同子账户；过高易 429）
     hot_window_concurrency: int = 1
     # 配置了 sell_start_time 时：开售整点（北京时间）之前多少秒开始登录并拉取子账号（全量更新内存缓存一次）
     sell_prep_seconds_before: int = 30
