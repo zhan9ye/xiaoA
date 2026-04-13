@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 const props = defineProps({
   token: { type: String, required: true },
@@ -172,12 +172,16 @@ const levelClass = (level) => {
   return "text-zinc-400";
 };
 
-const scrollLog = () => {
+/** 新日志追加后滚到底部，使最新一行留在可视区内；超出部分在上方被裁切。 */
+async function scrollLogToBottom() {
+  await nextTick();
   requestAnimationFrame(() => {
-    const el = logBox.value;
-    if (el) el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => {
+      const el = logBox.value;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   });
-};
+}
 
 const connectWs = () => {
   if (ws) {
@@ -199,7 +203,7 @@ const connectWs = () => {
       const data = JSON.parse(ev.data);
       logs.value.push(data);
       if (logs.value.length > 2000) logs.value = logs.value.slice(-2000);
-      scrollLog();
+      scrollLogToBottom();
     } catch (_) {}
   };
 };
@@ -1634,7 +1638,9 @@ onMounted(async () => {
           </div>
         </section>
 
-        <section class="flex max-h-[min(55vh,28rem)] flex-col rounded-xl border border-line bg-black shadow-inner">
+        <section
+          class="flex max-h-[min(52vh,26rem)] flex-col overflow-hidden rounded-xl border border-line bg-black shadow-inner"
+        >
           <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
             <h2 class="text-sm font-medium text-zinc-300">运行日志</h2>
             <button
@@ -1647,7 +1653,7 @@ onMounted(async () => {
           </div>
           <div
             ref="logBox"
-            class="min-h-0 max-h-[min(45vh,22rem)] flex-1 overflow-y-auto p-3 font-mono text-[13px] leading-relaxed"
+            class="min-h-0 flex-1 overflow-y-auto overscroll-y-contain p-3 font-mono text-[13px] leading-relaxed [scrollbar-gutter:stable]"
           >
             <div v-for="(line, i) in logs" :key="i" class="whitespace-pre-wrap break-all">
               <span class="text-emerald-500/90">[{{ line.ts }}]</span>
