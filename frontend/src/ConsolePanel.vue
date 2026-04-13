@@ -92,15 +92,22 @@ const subaccountControlsLocked = ref(false);
 const sellSortField = ref("create_time");
 /** false=升序 true=降序 */
 const sellSortDesc = ref(false);
+/** 与下拉四选一同步；create_asc | create_desc | ace_desc | ace_asc */
+const sellSortChoiceUi = ref("create_asc");
+/** 上次保存成功的选项，用于控制「保存」显隐 */
+const sellSortChoiceCommitted = ref("create_asc");
 const saveMsg = ref("");
 const saveRunParamsMsg = ref("");
 const configCollapsed = ref(false);
 const runParamsCollapsed = ref(false);
-/** true：仅显示符合当前运行参数的可卖子账号 */
-const showOnlyEligible = ref(false);
+
+const LS_CONFIG_COLLAPSED = "xiaoA_console_config_collapsed";
+const LS_RUN_PARAMS_COLLAPSED = "xiaoA_console_run_params_collapsed";
 
 /** GET /api/credits/overview */
 const creditsOverview = ref(null);
+/** false：套餐列表仅展示前 2 个；true：展示全部 */
+const creditsPackagesExpanded = ref(false);
 const redeemBusy = ref(false);
 const creditsMsg = ref("");
 const redeemConfirmOpen = ref(false);
@@ -125,6 +132,25 @@ const pwdChangeNew = ref("");
 const pwdChangeNew2 = ref("");
 const pwdChangeBusy = ref(false);
 const pwdChangeErr = ref("");
+
+const toastMessage = ref("");
+const toastVisible = ref(false);
+let toastTimer = null;
+
+function showToast(msg) {
+  if (!msg) return;
+  toastMessage.value = msg;
+  toastVisible.value = true;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastVisible.value = false;
+    toastMessage.value = "";
+    toastTimer = null;
+  }, 3000);
+}
+
+/** 运行控制：开始/停止合并按钮防连点 */
+const runToggleBusy = ref(false);
 
 let ws = null;
 
@@ -513,7 +539,7 @@ const displayedSubaccounts = computed(() => {
   const list = subaccounts.value;
   const byOriginalIndex = new Map();
   for (let i = 0; i < list.length; i++) byOriginalIndex.set(list[i], i);
-  const rows = showOnlyEligible.value ? list.filter((row) => isEligibleByRunParams(row)) : [...list];
+  const rows = [...list];
   return rows.sort((a, b) => {
     const ea = isEligibleByRunParams(a) ? 0 : 1;
     const eb = isEligibleByRunParams(b) ? 0 : 1;
@@ -523,6 +549,57 @@ const displayedSubaccounts = computed(() => {
     return (byOriginalIndex.get(a) ?? 0) - (byOriginalIndex.get(b) ?? 0);
   });
 });
+
+function choiceFromSortFieldDesc(field, desc) {
+  const f = field === "ace_amount" ? "ace" : "create";
+  const asc = !desc;
+  if (f === "create") return asc ? "create_asc" : "create_desc";
+  return asc ? "ace_asc" : "ace_desc";
+}
+
+function applySortChoiceToRefs(choice) {
+  switch (choice) {
+    case "create_desc":
+      sellSortField.value = "create_time";
+      sellSortDesc.value = true;
+      break;
+    case "ace_desc":
+      sellSortField.value = "ace_amount";
+      sellSortDesc.value = true;
+      break;
+    case "ace_asc":
+      sellSortField.value = "ace_amount";
+      sellSortDesc.value = false;
+      break;
+    case "create_asc":
+    default:
+      sellSortField.value = "create_time";
+      sellSortDesc.value = false;
+  }
+}
+
+function syncSellSortChoiceFromRefs() {
+  const ch = choiceFromSortFieldDesc(sellSortField.value, sellSortDesc.value);
+  sellSortChoiceUi.value = ch;
+  sellSortChoiceCommitted.value = ch;
+}
+
+watch(sellSortChoiceUi, (c) => {
+  applySortChoiceToRefs(c);
+});
+
+const displayedCreditPackages = computed(() => {
+  const pk = creditsOverview.value?.packages;
+  if (!Array.isArray(pk)) return [];
+  if (creditsPackagesExpanded.value || pk.length <= 2) return pk;
+  return pk.slice(0, 2);
+});
+
+const creditsPackagesHasMore = computed(
+  () => Array.isArray(creditsOverview.value?.packages) && creditsOverview.value.packages.length > 2,
+);
+
+const sellSortDirty = computed(() => sellSortChoiceUi.value !== sellSortChoiceCommitted.value);
 
 function splitMnemonicCsv(csv) {
   const parts = String(csv || "")
@@ -695,6 +772,7 @@ async function loadRunParamsFromServer() {
       sellSortField.value = rp.sell_sort_field;
     }
     if (rp.sell_sort_desc != null) sellSortDesc.value = !!rp.sell_sort_desc;
+    syncSellSortChoiceFromRefs();
   } catch (_) {}
 }
 
@@ -733,6 +811,7 @@ async function loadConfig() {
       tradeUser.value = "";
       tradePassword.value = "";
     }
+    syncSellSortChoiceFromRefs();
   } catch (_) {}
 }
 
@@ -857,8 +936,14 @@ async function saveConfig() {
       sellSortField.value = saved.sell_sort_field;
     }
     if (saved.sell_sort_desc != null) sellSortDesc.value = !!saved.sell_sort_desc;
+    syncSellSortChoiceFromRefs();
     if (saved.password != null) tradePassword.value = String(saved.password);
     saveMsg.value = "已保存";
+    showToast("交易端配置已保存");
+    try {
+      localStorage.setItem(LS_CONFIG_COLLAPSED, "1");
+    } catch (_) {}
+    configCollapsed.value = true;
     connectWs();
     await loadSubaccounts();
   } catch {
@@ -866,7 +951,7 @@ async function saveConfig() {
   }
 }
 
-async function saveRunParams() {
+async function saveRunParams(successToast = "") {
   saveRunParamsMsg.value = "";
   const body = {
     quantity_start_limit: Number(quantityStartLimit.value) || 0,
@@ -885,7 +970,7 @@ async function saveRunParams() {
     });
     if (r.status === 401) {
       emit("logout");
-      return;
+      return false;
     }
     if (!r.ok) {
       try {
@@ -898,7 +983,7 @@ async function saveRunParams() {
       } catch {
         saveRunParamsMsg.value = "保存失败";
       }
-      return;
+      return false;
     }
     const saved = await r.json();
     if (saved.quantity_start_limit != null) quantityStartLimit.value = saved.quantity_start_limit;
@@ -914,9 +999,17 @@ async function saveRunParams() {
       sellSortField.value = saved.sell_sort_field;
     }
     if (saved.sell_sort_desc != null) sellSortDesc.value = !!saved.sell_sort_desc;
+    syncSellSortChoiceFromRefs();
     saveRunParamsMsg.value = "已保存";
+    showToast(successToast || "运行参数已保存");
+    try {
+      localStorage.setItem(LS_RUN_PARAMS_COLLAPSED, "1");
+    } catch (_) {}
+    runParamsCollapsed.value = true;
+    return true;
   } catch {
     saveRunParamsMsg.value = "网络错误";
+    return false;
   }
 }
 
@@ -951,16 +1044,51 @@ async function refreshStatus() {
   } catch (_) {}
 }
 
-async function startRun() {
-  const r = await fetch("/api/run/start", { method: "POST", headers: headers() });
-  if (r.status === 401) emit("logout");
-  await refreshStatus();
-}
-
-async function stopRun() {
-  const r = await fetch("/api/run/stop", { method: "POST", headers: headers() });
-  if (r.status === 401) emit("logout");
-  await refreshStatus();
+async function toggleRun() {
+  if (runToggleBusy.value) return;
+  runToggleBusy.value = true;
+  try {
+    if (running.value) {
+      const r = await fetch("/api/run/stop", { method: "POST", headers: headers() });
+      if (r.status === 401) {
+        emit("logout");
+        return;
+      }
+      await refreshStatus();
+      if (r.ok) showToast("已停止售卖");
+      else {
+        try {
+          const err = await r.json();
+          const d = err.detail;
+          showToast(typeof d === "string" ? d : "停止失败");
+        } catch {
+          showToast("停止失败");
+        }
+      }
+    } else {
+      const r = await fetch("/api/run/start", { method: "POST", headers: headers() });
+      if (r.status === 401) {
+        emit("logout");
+        return;
+      }
+      if (!r.ok) {
+        try {
+          const err = await r.json();
+          const d = err.detail;
+          showToast(typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg || String(x)).join("；") : "启动失败");
+        } catch {
+          showToast("启动失败");
+        }
+        await refreshStatus();
+        return;
+      }
+      await refreshStatus();
+      if (running.value) showToast("已开始售卖");
+      else showToast("已提交");
+    }
+  } finally {
+    runToggleBusy.value = false;
+  }
 }
 
 function openPwdChange() {
@@ -1023,6 +1151,10 @@ watch(
   () => props.token,
   async () => {
     logs.value = [];
+    try {
+      if (localStorage.getItem(LS_CONFIG_COLLAPSED) === "1") configCollapsed.value = true;
+      if (localStorage.getItem(LS_RUN_PARAMS_COLLAPSED) === "1") runParamsCollapsed.value = true;
+    } catch (_) {}
     await loadMe();
     await loadCreditsOverview();
     await loadConfig();
@@ -1033,6 +1165,10 @@ watch(
 );
 
 onMounted(async () => {
+  try {
+    if (localStorage.getItem(LS_CONFIG_COLLAPSED) === "1") configCollapsed.value = true;
+    if (localStorage.getItem(LS_RUN_PARAMS_COLLAPSED) === "1") runParamsCollapsed.value = true;
+  } catch (_) {}
   await loadMe();
   await loadCreditsOverview();
   await loadConfig();
@@ -1040,11 +1176,11 @@ onMounted(async () => {
   connectWs();
   refreshStatus();
   const t = setInterval(refreshStatus, 3000);
-  onBeforeUnmount(() => clearInterval(t));
-});
-
-onBeforeUnmount(() => {
-  if (ws) ws.close();
+  onBeforeUnmount(() => {
+    clearInterval(t);
+    if (ws) ws.close();
+    if (toastTimer) clearTimeout(toastTimer);
+  });
 });
 </script>
 
@@ -1078,7 +1214,17 @@ onBeforeUnmount(() => {
           class="rounded-xl border border-line bg-card p-4 shadow-lg"
           :class="creditsOverview.subscription_active ? 'border-line' : 'border-amber-800/70 bg-amber-950/20'"
         >
-          <h2 class="mb-2 text-sm font-semibold text-zinc-100">积分与时长</h2>
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <h2 class="text-sm font-semibold text-zinc-100">积分与成长</h2>
+            <button
+              v-if="creditsPackagesHasMore"
+              type="button"
+              class="shrink-0 rounded border border-zinc-600 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              @click="creditsPackagesExpanded = !creditsPackagesExpanded"
+            >
+              {{ creditsPackagesExpanded ? "收起" : "显示更多" }}
+            </button>
+          </div>
           <p v-if="!creditsOverview.subscription_active" class="mb-2 text-xs text-amber-200/90">
             <template v-if="creditsOverview.subscription_end_at == null || creditsOverview.subscription_end_at === ''">
               尚未开通使用时长，交易与运行相关功能不可用，请兑换下方套餐或联系管理员充值积分。
@@ -1087,28 +1233,38 @@ onBeforeUnmount(() => {
               订阅已到期，相关功能已暂停，请兑换续期或联系管理员充值积分。
             </template>
           </p>
-          <div class="mb-2 space-y-1 text-xs text-zinc-400">
-            <p>
-              当前积分 <span class="font-mono text-amber-300/90">{{ creditsOverview.points_balance }}</span>
-            </p>
-            <p v-if="creditsOverview.subscription_active">
-              使用至
-              <span class="font-mono text-zinc-200">{{ formatSubscriptionEnd(creditsOverview.subscription_end_at) }}</span>
-              <span class="text-emerald-500/90">（有效）</span>
-            </p>
-            <p v-else-if="creditsOverview.subscription_end_at == null || creditsOverview.subscription_end_at === ''">
-              时长状态：<span class="text-amber-200/90">未开通</span>（须积分兑换）
-            </p>
-            <p v-else>
-              已于
-              <span class="font-mono text-zinc-200">{{ formatSubscriptionEnd(creditsOverview.subscription_end_at) }}</span>
-              到期
-            </p>
-          </div>
+          <p class="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-zinc-400">
+            <span>
+              当前积分：<span class="font-mono text-amber-300/90">{{ creditsOverview.points_balance }}</span>
+            </span>
+            <template v-if="creditsOverview.subscription_active">
+              <span class="text-zinc-600">·</span>
+              <span>
+                使用至：<span class="font-mono text-zinc-200">{{
+                  formatSubscriptionEnd(creditsOverview.subscription_end_at)
+                }}</span>
+                <span class="text-emerald-500/90">（有效）</span>
+              </span>
+            </template>
+            <template v-else-if="creditsOverview.subscription_end_at == null || creditsOverview.subscription_end_at === ''">
+              <span class="text-zinc-600">·</span>
+              <span>时长状态：<span class="text-amber-200/90">未开通</span>（须积分兑换）</span>
+            </template>
+            <template v-else>
+              <span class="text-zinc-600">·</span>
+              <span>
+                已于
+                <span class="font-mono text-zinc-200">{{
+                  formatSubscriptionEnd(creditsOverview.subscription_end_at)
+                }}</span>
+                到期
+              </span>
+            </template>
+          </p>
           <div class="max-h-[200px] space-y-1 overflow-auto rounded-lg border border-line/80 bg-black/25 p-2">
             <div
-              v-for="p in creditsOverview.packages"
-              :key="p.days"
+              v-for="(p, pi) in displayedCreditPackages"
+              :key="`${p.days}-${p.points_cost}-${pi}`"
               class="flex items-center justify-between gap-2 rounded border border-transparent px-1 py-1 text-[11px] hover:border-zinc-700"
             >
               <span class="text-zinc-400">{{ p.days }} 天 · {{ p.points_cost }} 积分</span>
@@ -1182,8 +1338,8 @@ onBeforeUnmount(() => {
           >
             保存配置
           </button>
-          <p v-if="saveMsg" class="mt-2 text-center text-xs text-zinc-400">{{ saveMsg }}</p>
           </div>
+          <p v-if="saveMsg" class="mt-2 text-center text-xs text-zinc-400">{{ saveMsg }}</p>
         </section>
 
         <section class="rounded-xl border border-line bg-card p-4 shadow-lg">
@@ -1232,6 +1388,7 @@ onBeforeUnmount(() => {
             保存运行参数
           </button>
           </div>
+          <p v-if="saveRunParamsMsg" class="mt-2 text-center text-xs text-emerald-400/90">{{ saveRunParamsMsg }}</p>
         </section>
       </aside>
 
@@ -1240,27 +1397,24 @@ onBeforeUnmount(() => {
           <div class="flex flex-col gap-4">
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <h2 class="text-sm font-semibold tracking-tight text-zinc-100">运行控制</h2>
-              <div class="flex w-full shrink-0 gap-2 sm:w-auto">
+              <div class="flex w-full shrink-0 sm:w-auto">
                 <button
                   type="button"
-                  class="min-h-[2.5rem] flex-1 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 sm:flex-initial"
-                  :disabled="running"
+                  class="min-h-[2.75rem] w-full rounded-lg px-4 text-sm font-medium transition-colors disabled:opacity-40 sm:w-auto sm:min-w-[14rem]"
+                  :class="
+                    running
+                      ? 'bg-red-600 text-white hover:bg-red-500'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-500'
+                  "
+                  :disabled="runToggleBusy"
                   :title="
-                    timedSellWouldSkipOutboundIfStarted
+                    timedSellWouldSkipOutboundIfStarted && !running
                       ? '已超过今日开售缓冲：点开始将仅内部等待至次日，不调用登录/子账号/助记词/售卖'
                       : ''
                   "
-                  @click="startRun"
+                  @click="toggleRun"
                 >
-                  开始
-                </button>
-                <button
-                  type="button"
-                  class="min-h-[2.5rem] flex-1 rounded-lg bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-40 sm:flex-initial"
-                  :disabled="!running"
-                  @click="stopRun"
-                >
-                  停止
+                  {{ running ? "售卖中「点击停止」" : "停止中「点击开始」" }}
                 </button>
               </div>
             </div>
@@ -1325,12 +1479,11 @@ onBeforeUnmount(() => {
                       : 'border-zinc-700/80 bg-zinc-900/60 text-zinc-500'
                   "
                   :disabled="!sellTimeIsDirty"
-                  @click="saveRunParams"
+                  @click="saveRunParams('开售时间已保存')"
                 >
                   {{ sellTimeIsDirty ? "保存时间" : "已保存" }}
                 </button>
               </div>
-              <p v-if="saveRunParamsMsg" class="text-xs text-emerald-400/90">{{ saveRunParamsMsg }}</p>
             </div>
           </div>
         </section>
@@ -1344,14 +1497,7 @@ onBeforeUnmount(() => {
               </span>
               <button
                 type="button"
-                class="rounded border border-zinc-600 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-                @click="showOnlyEligible = !showOnlyEligible"
-              >
-                {{ showOnlyEligible ? "显示全部" : "只显示可卖" }}
-              </button>
-              <button
-                type="button"
-                class="rounded border border-zinc-600 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                class="min-h-[2.25rem] rounded-lg border border-zinc-500 bg-zinc-800/80 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
                 :disabled="subaccountsRefreshBusy || subaccountControlsLocked"
                 @click="refreshSubaccounts"
               >
@@ -1365,34 +1511,27 @@ onBeforeUnmount(() => {
           >
             开售进行中：已锁定子账号刷新与售卖顺序。
           </p>
-          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2 text-xs">
-            <span class="text-zinc-500">售卖顺序</span>
+          <div class="flex flex-col gap-2 border-b border-line px-4 py-3">
+            <span class="text-xs font-medium text-zinc-500">售卖顺序</span>
             <select
-              v-model="sellSortField"
-              class="rounded border border-line bg-black/40 px-2 py-1 text-zinc-200 outline-none ring-blue-500 focus:ring-1 disabled:cursor-not-allowed disabled:opacity-50"
+              v-model="sellSortChoiceUi"
+              class="w-full max-w-md rounded-lg border border-line bg-black/40 px-3 py-2.5 text-base text-zinc-100 outline-none ring-amber-500/40 focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50 sm:text-lg"
               :disabled="subaccountControlsLocked"
             >
-              <option value="create_time">创建时间</option>
-              <option value="ace_amount">股数</option>
-            </select>
-            <select
-              class="rounded border border-line bg-black/40 px-2 py-1 text-zinc-200 outline-none ring-blue-500 focus:ring-1 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="subaccountControlsLocked"
-              :value="sellSortDesc ? 'desc' : 'asc'"
-              @change="sellSortDesc = $event.target.value === 'desc'"
-            >
-              <option value="asc">升序</option>
-              <option value="desc">降序</option>
+              <option value="create_asc">创建时间从早到晚</option>
+              <option value="create_desc">创建时间从晚到早</option>
+              <option value="ace_desc">股数从多到少</option>
+              <option value="ace_asc">股数从少到多</option>
             </select>
             <button
+              v-if="sellSortDirty"
               type="button"
-              class="rounded border border-zinc-600 px-2 py-0.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+              class="max-w-md rounded-lg bg-amber-600/90 px-4 py-2.5 text-base font-medium text-zinc-950 hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-40 sm:text-lg"
               :disabled="subaccountControlsLocked"
-              @click="saveRunParams"
+              @click="saveRunParams('售卖顺序已保存')"
             >
-              保存顺序
+              保存
             </button>
-            <span class="text-zinc-600">（保存后与后台实际售卖顺序一致）</span>
           </div>
           <p
             v-if="subaccountsRefreshMsg"
@@ -1489,14 +1628,14 @@ onBeforeUnmount(() => {
               </tbody>
             </table>
             <p v-else-if="subaccounts.length && !displayedSubaccounts.length" class="p-6 text-center text-sm text-zinc-600">
-              当前筛选下无可卖子账号，可点「显示全部」
+              暂无展示数据
             </p>
             <p v-else class="p-6 text-center text-sm text-zinc-600">暂无数据，请先保存配置并完成登录拉取</p>
           </div>
         </section>
 
-        <section class="flex min-h-[360px] flex-col rounded-xl border border-line bg-black shadow-inner">
-          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
+        <section class="flex max-h-[min(55vh,28rem)] flex-col rounded-xl border border-line bg-black shadow-inner">
+          <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
             <h2 class="text-sm font-medium text-zinc-300">运行日志</h2>
             <button
               type="button"
@@ -1506,7 +1645,10 @@ onBeforeUnmount(() => {
               清空日志
             </button>
           </div>
-          <div ref="logBox" class="flex-1 overflow-y-auto p-3 font-mono text-[13px] leading-relaxed">
+          <div
+            ref="logBox"
+            class="min-h-0 max-h-[min(45vh,22rem)] flex-1 overflow-y-auto p-3 font-mono text-[13px] leading-relaxed"
+          >
             <div v-for="(line, i) in logs" :key="i" class="whitespace-pre-wrap break-all">
               <span class="text-emerald-500/90">[{{ line.ts }}]</span>
               <span class="mx-1" :class="levelClass(line.level)">{{ line.message }}</span>
@@ -1704,6 +1846,21 @@ onBeforeUnmount(() => {
             {{ listingEditBusy ? "保存中…" : "保存" }}
           </button>
         </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="toastVisible"
+      class="pointer-events-none fixed bottom-6 left-1/2 z-[500] -translate-x-1/2 px-4"
+      role="status"
+      aria-live="polite"
+    >
+      <div
+        class="pointer-events-auto max-w-[min(90vw,24rem)] rounded-xl border border-zinc-600 bg-zinc-900/95 px-4 py-3 text-center text-sm text-zinc-100 shadow-xl backdrop-blur-sm"
+      >
+        {{ toastMessage }}
       </div>
     </div>
   </Teleport>
