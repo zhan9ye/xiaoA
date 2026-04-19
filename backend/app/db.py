@@ -66,6 +66,51 @@ async def init_db() -> None:
                     "ALTER TABLE trading_configs ADD COLUMN sell_sort_desc INTEGER DEFAULT 0"
                 )
 
+            rows = (await conn.exec_driver_sql("PRAGMA table_info(trading_configs)")).fetchall()
+            cols = {str(r[1]) for r in rows}
+            if "slot" not in cols:
+                await conn.exec_driver_sql("ALTER TABLE trading_configs RENAME TO trading_configs_old")
+
+                def _create_trading_configs(sync_conn):
+                    from app.models import TradingConfig  # noqa: PLC0415
+
+                    TradingConfig.__table__.create(sync_conn, checkfirst=True)
+
+                await conn.run_sync(_create_trading_configs)
+                await conn.exec_driver_sql(
+                    """
+                    INSERT INTO trading_configs (
+                        user_id, slot, username, password_enc, key_token_enc, mnemonic_enc,
+                        rpc_login_key_enc, rpc_user_id, rpc_version, quantity_start_limit,
+                        request_interval_ms, run_period_start, run_period_end, runner_enabled,
+                        sell_start_time, sold_son_ids_json, listing_amounts_json,
+                        sell_sort_field, sell_sort_desc
+                    )
+                    SELECT
+                        user_id,
+                        0 AS slot,
+                        username,
+                        password_enc,
+                        key_token_enc,
+                        mnemonic_enc,
+                        rpc_login_key_enc,
+                        rpc_user_id,
+                        rpc_version,
+                        quantity_start_limit,
+                        COALESCE(request_interval_ms, 500),
+                        run_period_start,
+                        run_period_end,
+                        COALESCE(runner_enabled, 0),
+                        COALESCE(sell_start_time, ''),
+                        COALESCE(sold_son_ids_json, '{}'),
+                        COALESCE(listing_amounts_json, '{}'),
+                        COALESCE(sell_sort_field, 'create_time'),
+                        COALESCE(sell_sort_desc, 0)
+                    FROM trading_configs_old
+                    """
+                )
+                await conn.exec_driver_sql("DROP TABLE trading_configs_old")
+
             urows = (await conn.exec_driver_sql("PRAGMA table_info(users)")).fetchall()
             ucols = {str(r[1]) for r in urows}
             if "points_balance" not in ucols:
@@ -84,4 +129,8 @@ async def init_db() -> None:
                 await conn.execute(
                     text("UPDATE users SET subscription_end_at = :far WHERE subscription_end_at IS NULL"),
                     {"far": far},
+                )
+            if "active_trading_slot" not in ucols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN active_trading_slot INTEGER NOT NULL DEFAULT 0"
                 )

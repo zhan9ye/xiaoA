@@ -14,7 +14,7 @@ from app.models import User
 CREDIT_PACKAGES: Dict[int, int] = {
     7: 1000,
     30: 3000,
-    90: 9000,
+    90: 8500,
     180: 16000,
     360: 28000,
 }

@@ -8,6 +8,8 @@ from app.schemas import AppConfigIn
 @dataclass
 class AppState:
     config: Optional[AppConfigIn] = None
+    # 与 DB users.active_trading_slot 对齐；用于 ensure_trading_config_loaded 避免跨槽误用缓存
+    loaded_config_slot: Optional[int] = None
     runner_task: Optional[asyncio.Task] = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     last_runner_error: Optional[str] = None

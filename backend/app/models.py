@@ -33,6 +33,8 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # 当前使用的交易端配置槽位 0–2（与 trading_configs 复合主键一致）
+    active_trading_slot: Mapped[int] = mapped_column(Integer, default=0)
     password_hash: Mapped[str] = mapped_column(String(255))
     is_disabled: Mapped[bool] = mapped_column(Boolean, default=False)
     points_balance: Mapped[int] = mapped_column(Integer, default=0)
@@ -73,11 +75,12 @@ class RunnerLease(Base):
 
 
 class TradingConfig(Base):
-    """交易端配置持久化（与平台用户一对一）。"""
+    """交易端配置持久化；每用户最多 3 套（slot=0,1,2）。"""
 
     __tablename__ = "trading_configs"
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    slot: Mapped[int] = mapped_column(Integer, primary_key=True, default=0)
     username: Mapped[str] = mapped_column(String(128), default="")
     password_enc: Mapped[str] = mapped_column(Text, default="")
     key_token_enc: Mapped[str] = mapped_column(Text, default="")

@@ -24,6 +24,8 @@ from app.schemas import (
     AppConfigFormIn,
     AppConfigIn,
     AppConfigOut,
+    TradingConfigSwitchIn,
+    TradingSlotBrief,
     AuthSiteInfoOut,
     ChangePasswordIn,
     ListingAmountPatchIn,
@@ -88,8 +90,21 @@ from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
 from app.proxy_binding import get_session_manager_for_user_id
 from app.rpc_v import compute_js_timespan_v
-from app.trading_config_repo import ensure_trading_config_loaded, load_trading_config, persist_trading_config
-from app.user_registry import get_or_create_log_hub, get_or_create_state, shutdown_all
+from app.trading_config_repo import (
+    ensure_trading_config_loaded,
+    get_active_trading_slot,
+    list_trading_slot_briefs,
+    load_trading_config,
+    load_trading_config_slot,
+    persist_trading_config,
+    set_active_trading_slot,
+)
+from app.user_registry import (
+    get_or_create_log_hub,
+    get_or_create_state,
+    invalidate_user_outbound_session,
+    shutdown_all,
+)
 
 
 def _trading_password_for_api(pw: str) -> str:
@@ -113,6 +128,63 @@ def _run_status_timed_sell_flags(st) -> Tuple[bool, bool]:
     return internal_only, would_skip
 
 
+def _clear_trading_runtime_for_slot_switch(st) -> None:
+    """切换交易端槽位后丢弃内存中的登录态与子账号等，强制按新槽重新登录。"""
+    st.config = None
+    st.loaded_config_slot = None
+    st.subaccounts_cache = []
+    st.sell_mnemonic_id1 = ""
+    st.sell_mnemonic_key = ""
+    st.sell_mnemonic_str1 = ""
+    st.logged_in = False
+    st.runner_must_refresh_trading_cache = True
+    st.runner_sub_prep_date = ""
+    st.runner_late_start_skip_outbound_today = ""
+    st.last_ace_sell_monotonic = 0.0
+    st.last_ace_sell_monotonic_by_son.clear()
+
+
+async def _app_config_out(db: AsyncSession, user_id: int, st) -> AppConfigOut:
+    act = await get_active_trading_slot(db, user_id)
+    slots_raw = await list_trading_slot_briefs(db, user_id)
+    slots_out = [TradingSlotBrief(**s) for s in slots_raw]
+    await ensure_trading_config_loaded(db, user_id, st)
+    if st.config is None:
+        return AppConfigOut(
+            username="",
+            password="",
+            key_token="",
+            mnemonic="",
+            quantity_start_limit=1000,
+            request_interval_ms=1000,
+            run_period_start="",
+            run_period_end="",
+            sell_start_time="",
+            sell_sort_field="create_time",
+            sell_sort_desc=False,
+            listing_amounts={},
+            active_slot=act,
+            slots=slots_out,
+        )
+    c = st.config
+    return AppConfigOut(
+        username=c.username,
+        password=_trading_password_for_api(c.password),
+        key_token=c.key_token,
+        mnemonic=c.mnemonic,
+        quantity_start_limit=c.quantity_start_limit,
+        request_interval_ms=c.request_interval_ms,
+        run_period_start=c.run_period_start,
+        run_period_end=c.run_period_end,
+        sell_start_time=c.sell_start_time or "",
+        sell_sort_field=c.sell_sort_field,
+        sell_sort_desc=c.sell_sort_desc,
+        listing_amounts=listing_amounts_for_api(c),
+        active_slot=act,
+        slots=slots_out,
+    )
+
+
 def _apply_timed_sell_late_start_skip_flag(st, cfg: Optional[AppConfigIn]) -> None:
     """
     配置了 sell_start_time 且当前已超过「开售整点 + sell_start_missed_grace_minutes」时，
@@ -133,7 +205,15 @@ async def _resume_runner_tasks() -> None:
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as session:
-        r = await session.execute(select(TradingConfig.user_id).where(TradingConfig.runner_enabled.is_(True)))
+        r = await session.execute(
+            select(TradingConfig.user_id)
+            .select_from(TradingConfig)
+            .join(User, User.id == TradingConfig.user_id)
+            .where(
+                TradingConfig.runner_enabled.is_(True),
+                User.active_trading_slot == TradingConfig.slot,
+            )
+        )
         uids = [row[0] for row in r.all()]
     for uid in uids:
         async with AsyncSessionLocal() as session:
@@ -143,11 +223,15 @@ async def _resume_runner_tasks() -> None:
         st = await get_or_create_state(uid)
         if st.runner_task is not None and not st.runner_task.done():
             continue
+        act_slot = 0
         async with AsyncSessionLocal() as session:
             cfg = await load_trading_config(session, uid)
+            if cfg is not None:
+                act_slot = await get_active_trading_slot(session, uid)
         if cfg is None:
             continue
         st.config = cfg
+        st.loaded_config_slot = act_slot
         st.stop_event = asyncio.Event()
         st.runner_must_refresh_trading_cache = True
         _apply_timed_sell_late_start_skip_flag(st, cfg)
@@ -338,16 +422,19 @@ async def credits_redeem(
     )
 
 
-@app.post("/api/config")
+@app.post("/api/config", response_model=AppConfigOut)
 async def save_config(
     body: AppConfigFormIn,
-    user: User = Depends(require_active_subscription),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AppConfigOut:
+    active_slot = await get_active_trading_slot(db, user.id)
+    target_slot = body.config_slot if body.config_slot is not None else active_slot
+    target_slot = max(0, min(2, int(target_slot)))
     st = await get_or_create_state(user.id)
     await ensure_trading_config_loaded(db, user.id, st)
-    prev = st.config
-    if subaccount_controls_locked(st) and prev is not None:
+    prev = await load_trading_config_slot(db, user.id, target_slot)
+    if subaccount_controls_locked(st) and prev is not None and target_slot == active_slot:
         if body.sell_sort_field != prev.sell_sort_field or body.sell_sort_desc != prev.sell_sort_desc:
             raise HTTPException(status_code=403, detail="开售已开始，无法修改子账号售卖顺序")
     new_pw = (body.password or "").strip()
@@ -373,7 +460,7 @@ async def save_config(
     if prev and not (new_sell or "").strip() and (prev.sell_start_time or "").strip():
         new_sell = prev.sell_start_time
     ri = max(500, int(body.request_interval_ms or 1000))
-    st.config = AppConfigIn(
+    new_cfg = AppConfigIn(
         username=body.username.strip(),
         password=new_pw,
         mnemonic=new_mnemonic,
@@ -391,45 +478,50 @@ async def save_config(
         sell_sort_field=body.sell_sort_field,
         sell_sort_desc=body.sell_sort_desc,
     )
-    await persist_trading_config(db, user.id, st.config)
-    c = st.config
-    return AppConfigOut(
-        username=c.username,
-        password=_trading_password_for_api(c.password),
-        key_token=c.key_token,
-        mnemonic=c.mnemonic,
-        quantity_start_limit=c.quantity_start_limit,
-        request_interval_ms=c.request_interval_ms,
-        run_period_start=c.run_period_start,
-        run_period_end=c.run_period_end,
-        sell_start_time=c.sell_start_time or "",
-        sell_sort_field=c.sell_sort_field,
-        sell_sort_desc=c.sell_sort_desc,
-        listing_amounts=listing_amounts_for_api(c),
-    )
+    await persist_trading_config(db, user.id, target_slot, new_cfg)
+    act = await get_active_trading_slot(db, user.id)
+    if target_slot == act:
+        st.config = new_cfg
+        st.loaded_config_slot = act
+    else:
+        await ensure_trading_config_loaded(db, user.id, st)
+    return await _app_config_out(db, user.id, st)
 
 
-@app.get("/api/config")
+@app.get("/api/config", response_model=AppConfigOut)
 async def get_config(user: User = Depends(require_active_subscription), db: AsyncSession = Depends(get_db)):
     st = await get_or_create_state(user.id)
-    await ensure_trading_config_loaded(db, user.id, st)
-    if st.config is None:
-        return {}
-    c = st.config
-    return AppConfigOut(
-        username=c.username,
-        password=_trading_password_for_api(c.password),
-        key_token=c.key_token,
-        mnemonic=c.mnemonic,
-        quantity_start_limit=c.quantity_start_limit,
-        request_interval_ms=c.request_interval_ms,
-        run_period_start=c.run_period_start,
-        run_period_end=c.run_period_end,
-        sell_start_time=c.sell_start_time or "",
-        sell_sort_field=c.sell_sort_field,
-        sell_sort_desc=c.sell_sort_desc,
-        listing_amounts=listing_amounts_for_api(c),
-    )
+    return await _app_config_out(db, user.id, st)
+
+
+@app.post("/api/config/switch", response_model=AppConfigOut)
+async def switch_trading_slot_endpoint(
+    body: TradingConfigSwitchIn,
+    user: User = Depends(require_active_subscription),
+    db: AsyncSession = Depends(get_db),
+) -> AppConfigOut:
+    st = await get_or_create_state(user.id)
+    old_slot = await get_active_trading_slot(db, user.id)
+    new_slot = max(0, min(2, int(body.slot)))
+    if new_slot != old_slot:
+        old_cfg = await load_trading_config_slot(db, user.id, old_slot)
+        if old_cfg is not None and old_cfg.runner_enabled:
+            await persist_trading_config(
+                db, user.id, old_slot, old_cfg.model_copy(update={"runner_enabled": False})
+            )
+        st.stop_event.set()
+        if st.runner_task is not None and not st.runner_task.done():
+            st.runner_task.cancel()
+            try:
+                await st.runner_task
+            except asyncio.CancelledError:
+                pass
+        st.runner_task = None
+        st.hot_sell_window_active = False
+        _clear_trading_runtime_for_slot_switch(st)
+        await invalidate_user_outbound_session(user.id)
+        await set_active_trading_slot(db, user.id, new_slot)
+    return await _app_config_out(db, user.id, st)
 
 
 @app.patch("/api/config/listing-amount")
@@ -480,14 +572,16 @@ async def patch_listing_amount(
     new_json = json.dumps(m, ensure_ascii=False, separators=(",", ":"))
     new_cfg = cfg.model_copy(update={"listing_amounts_json": new_json})
     st.config = new_cfg
-    await persist_trading_config(db, user.id, new_cfg)
+    slot_a = await get_active_trading_slot(db, user.id)
+    await persist_trading_config(db, user.id, slot_a, new_cfg)
     return {"ok": True, "listing_amounts": listing_amounts_for_api(new_cfg)}
 
 
 @app.get("/api/config/run-params", response_model=RunParamsOut)
 async def get_run_params(user: User = Depends(require_active_subscription), db: AsyncSession = Depends(get_db)):
     """从数据库读取运行参数（明文列，无需解密）；无记录时返回与前端一致的默认。"""
-    row = await db.get(TradingConfig, user.id)
+    slot_rp = await get_active_trading_slot(db, user.id)
+    row = await db.get(TradingConfig, (user.id, slot_rp))
     if row is None:
         return RunParamsOut(
             quantity_start_limit=1000,
@@ -545,7 +639,8 @@ async def patch_run_params(
             "sell_sort_desc": new_sd,
         }
     )
-    await persist_trading_config(db, user.id, st.config)
+    slot_a = await get_active_trading_slot(db, user.id)
+    await persist_trading_config(db, user.id, slot_a, st.config)
     c = st.config
     return RunParamsOut(
         quantity_start_limit=c.quantity_start_limit,
@@ -745,7 +840,8 @@ async def refresh_subaccounts(
         merged, _ = merge_from_rpc_login(cfg, login_res.response_body)
         st.config = merged
         st.logged_in = True
-        await persist_trading_config(db, user.id, merged)
+        slot_a = await get_active_trading_slot(db, user.id)
+        await persist_trading_config(db, user.id, slot_a, merged)
         cfg = merged
         rk = merged.rpc_login_key.strip()
         uid = merged.rpc_user_id.strip()
@@ -825,7 +921,8 @@ async def run_start(
     if cfg is None:
         raise HTTPException(status_code=400, detail="请先保存配置")
     st.config = cfg.model_copy(update={"runner_enabled": True})
-    await persist_trading_config(db, user.id, st.config)
+    slot_a = await get_active_trading_slot(db, user.id)
+    await persist_trading_config(db, user.id, slot_a, st.config)
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
     st.hot_sell_window_active = False
@@ -853,7 +950,8 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
     await ensure_trading_config_loaded(db, user.id, st)
     if st.config is not None:
         st.config = st.config.model_copy(update={"runner_enabled": False})
-        await persist_trading_config(db, user.id, st.config)
+        slot_a = await get_active_trading_slot(db, user.id)
+        await persist_trading_config(db, user.id, slot_a, st.config)
     st.stop_event.set()
     if st.runner_task is not None and not st.runner_task.done():
         st.runner_task.cancel()

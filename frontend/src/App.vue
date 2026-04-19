@@ -51,7 +51,8 @@ function logout() {
 <template>
   <AdminPanel v-if="isAdminView" />
   <template v-else-if="token">
-    <ConsolePanel :token="token" @logout="logout" />
+    <ContactPage v-if="isContactView" :logged-in="true" />
+    <ConsolePanel v-else :token="token" @logout="logout" />
   </template>
   <template v-else>
     <ContactPage v-if="isContactView" />

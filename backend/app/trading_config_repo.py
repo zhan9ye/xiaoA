@@ -1,12 +1,14 @@
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AsyncSessionLocal
-from app.models import TradingConfig
+from app.models import TradingConfig, User
 from app.schemas import AppConfigIn
 from app.state import AppState
 from app.trading_crypto import decrypt_trading_field, encrypt_trading_field
+
+MAX_TRADING_CONFIG_SLOTS = 3
 
 
 def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
@@ -46,8 +48,30 @@ def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
     )
 
 
-async def load_trading_config(session: AsyncSession, user_id: int) -> Optional[AppConfigIn]:
-    row = await session.get(TradingConfig, user_id)
+async def get_active_trading_slot(session: AsyncSession, user_id: int) -> int:
+    u = await session.get(User, user_id)
+    if u is None:
+        return 0
+    s = getattr(u, "active_trading_slot", None)
+    if s is None:
+        return 0
+    return max(0, min(MAX_TRADING_CONFIG_SLOTS - 1, int(s)))
+
+
+async def set_active_trading_slot(session: AsyncSession, user_id: int, slot: int) -> None:
+    slot = max(0, min(MAX_TRADING_CONFIG_SLOTS - 1, int(slot)))
+    u = await session.get(User, user_id)
+    if u is None:
+        return
+    u.active_trading_slot = slot
+    await session.commit()
+
+
+async def load_trading_config_slot(
+    session: AsyncSession, user_id: int, slot: int
+) -> Optional[AppConfigIn]:
+    slot = max(0, min(MAX_TRADING_CONFIG_SLOTS - 1, int(slot)))
+    row = await session.get(TradingConfig, (user_id, slot))
     if row is None:
         return None
     try:
@@ -56,8 +80,37 @@ async def load_trading_config(session: AsyncSession, user_id: int) -> Optional[A
         return None
 
 
-async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppConfigIn) -> None:
-    row = await session.get(TradingConfig, user_id)
+async def load_trading_config(session: AsyncSession, user_id: int) -> Optional[AppConfigIn]:
+    """加载当前用户「活动槽位」的交易配置。"""
+    slot = await get_active_trading_slot(session, user_id)
+    return await load_trading_config_slot(session, user_id, slot)
+
+
+async def list_trading_slot_briefs(session: AsyncSession, user_id: int) -> List[Dict[str, Any]]:
+    active = await get_active_trading_slot(session, user_id)
+    out: List[Dict[str, Any]] = []
+    for slot in range(MAX_TRADING_CONFIG_SLOTS):
+        row = await session.get(TradingConfig, (user_id, slot))
+        uname = (row.username or "").strip() if row else ""
+        has_saved = row is not None and (
+            bool(uname) or bool((row.password_enc or "").strip()) or bool((row.key_token_enc or "").strip())
+        )
+        out.append(
+            {
+                "slot": slot,
+                "username": uname,
+                "has_saved": has_saved,
+                "is_active": slot == active,
+            }
+        )
+    return out
+
+
+async def persist_trading_config(
+    session: AsyncSession, user_id: int, slot: int, cfg: AppConfigIn
+) -> None:
+    slot = max(0, min(MAX_TRADING_CONFIG_SLOTS - 1, int(slot)))
+    row = await session.get(TradingConfig, (user_id, slot))
     pw_enc = encrypt_trading_field(cfg.password)
     key_enc = encrypt_trading_field(cfg.key_token)
     mn_enc = encrypt_trading_field(cfg.mnemonic)
@@ -68,6 +121,7 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
     if row is None:
         row = TradingConfig(
             user_id=user_id,
+            slot=slot,
             username=cfg.username,
             password_enc=pw_enc,
             key_token_enc=key_enc,
@@ -110,14 +164,15 @@ async def persist_trading_config(session: AsyncSession, user_id: int, cfg: AppCo
 
 async def persist_trading_config_standalone(user_id: int, cfg: AppConfigIn) -> None:
     async with AsyncSessionLocal() as session:
-        await persist_trading_config(session, user_id, cfg)
+        slot = await get_active_trading_slot(session, user_id)
+        await persist_trading_config(session, user_id, slot, cfg)
 
 
 async def ensure_trading_config_loaded(db: AsyncSession, user_id: int, st: AppState) -> bool:
-    if st.config is not None:
+    slot = await get_active_trading_slot(db, user_id)
+    if st.config is not None and st.loaded_config_slot == slot:
         return True
-    cfg = await load_trading_config(db, user_id)
-    if cfg is None:
-        return False
+    cfg = await load_trading_config_slot(db, user_id, slot)
     st.config = cfg
-    return True
+    st.loaded_config_slot = slot
+    return cfg is not None

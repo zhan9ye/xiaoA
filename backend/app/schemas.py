@@ -86,6 +86,12 @@ class AppConfigFormIn(BaseModel):
         description="子账号售卖顺序：create_time=创建日，ace_amount=股数",
     )
     sell_sort_desc: bool = Field(default=False, description="True=降序，False=升序")
+    config_slot: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2,
+        description="保存到哪一套交易端配置（0–2）；省略则写入当前活动槽",
+    )
 
     @field_validator("sell_sort_field", mode="before")
     @classmethod
@@ -182,6 +188,17 @@ class AppConfigIn(BaseModel):
         return self
 
 
+class TradingSlotBrief(BaseModel):
+    slot: int
+    username: str = ""
+    has_saved: bool = False
+    is_active: bool = False
+
+
+class TradingConfigSwitchIn(BaseModel):
+    slot: int = Field(..., ge=0, le=2, description="切换为使用该槽的交易端配置并清空会话缓存")
+
+
 class AppConfigOut(BaseModel):
     username: str
     password: str = Field(
@@ -200,6 +217,11 @@ class AppConfigOut(BaseModel):
     listing_amounts: Dict[str, str] = Field(
         default_factory=dict,
         description="挂售数量覆盖 sonId→数量；缺省键表示用全部股数",
+    )
+    active_slot: int = Field(default=0, ge=0, le=2, description="当前活动配置槽")
+    slots: List[TradingSlotBrief] = Field(
+        default_factory=list,
+        description="各槽是否已保存、槽内交易用户名等简报",
     )
 
 

@@ -1,6 +1,11 @@
 <script setup>
 import { ref } from "vue";
 
+defineProps({
+  /** 已登录控制台时从 #/contact 进入，返回按钮文案为「返回控制台」 */
+  loggedIn: { type: Boolean, default: false },
+});
+
 const WECHAT_ID = "Feng199003026";
 const QR_SRC = "/contact/wechat.jpg";
 
@@ -73,7 +78,7 @@ function onImgError() {
         class="mb-6 text-sm text-violet-400/90 hover:text-violet-300"
         @click="backToLogin"
       >
-        ← 返回登录
+        {{ loggedIn ? "← 返回控制台" : "← 返回登录" }}
       </button>
 
       <div class="mb-8 text-center">

@@ -97,6 +97,18 @@ const sellSortChoiceUi = ref("create_asc");
 const sellSortChoiceCommitted = ref("create_asc");
 const saveMsg = ref("");
 const saveRunParamsMsg = ref("");
+/** 当前用于售卖的账户槽 0–2（与后端 users.active_trading_slot 一致） */
+const activeTradingSlot = ref(0);
+/** 各账户槽简报（GET/POST /api/config 返回的 slots） */
+const tradingSlotsBrief = ref([]);
+const switchSlotBusy = ref(false);
+/** 切换售卖账户前的确认弹窗 */
+const switchAccountConfirmOpen = ref(false);
+const switchAccountTargetSlot = ref(0);
+const switchAccountPrevSlot = ref(0);
+/** 弹窗展示：切换前账户的交易端用户名（来自 slots 简报） */
+const switchAccountPrevDisplayName = ref("");
+const switchConfirmErr = ref("");
 const configCollapsed = ref(false);
 const runParamsCollapsed = ref(false);
 
@@ -146,6 +158,10 @@ function showToast(msg) {
     toastMessage.value = "";
     toastTimer = null;
   }, 3000);
+}
+
+function goToContact() {
+  window.location.hash = "#/contact";
 }
 
 /** 运行控制：开始/停止合并按钮防连点 */
@@ -779,6 +795,81 @@ async function loadRunParamsFromServer() {
   } catch (_) {}
 }
 
+function slotBrief(slotIdx) {
+  const arr = tradingSlotsBrief.value;
+  if (!Array.isArray(arr)) return null;
+  return arr.find((x) => Number(x.slot) === slotIdx) || null;
+}
+
+function openSwitchAccountConfirm(targetSlot) {
+  if (switchSlotBusy.value || targetSlot === activeTradingSlot.value) return;
+  switchConfirmErr.value = "";
+  const prevSlot = activeTradingSlot.value;
+  switchAccountPrevSlot.value = prevSlot;
+  switchAccountTargetSlot.value = targetSlot;
+  const prevBrief = slotBrief(prevSlot);
+  const uname = (prevBrief?.username != null ? String(prevBrief.username) : "").trim();
+  switchAccountPrevDisplayName.value = uname || "未配置";
+  switchAccountConfirmOpen.value = true;
+}
+
+function closeSwitchAccountConfirm() {
+  if (switchSlotBusy.value) return;
+  switchAccountConfirmOpen.value = false;
+}
+
+/** 调用切换接口后拉配置并自动刷新子账号（含 RPC 登录）。成功返回 true。 */
+async function executeSwitchTradingSlot(slotIdx) {
+  if (switchSlotBusy.value || slotIdx === activeTradingSlot.value) return false;
+  switchSlotBusy.value = true;
+  saveMsg.value = "";
+  switchConfirmErr.value = "";
+  try {
+    const r = await fetch("/api/config/switch", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ slot: slotIdx }),
+    });
+    if (r.status === 401) {
+      switchAccountConfirmOpen.value = false;
+      emit("logout");
+      return false;
+    }
+    if (!r.ok) {
+      try {
+        const err = await r.json();
+        const d = err.detail;
+        const msg = typeof d === "string" ? d : "切换失败";
+        saveMsg.value = msg;
+        switchConfirmErr.value = msg;
+      } catch {
+        saveMsg.value = "切换失败";
+        switchConfirmErr.value = "切换失败";
+      }
+      return false;
+    }
+    await loadConfig();
+    subaccounts.value = [];
+    await refreshSubaccounts();
+    await refreshStatus();
+    showToast(`已切换到账户 ${slotIdx + 1}，已尝试自动登录并刷新子账号列表。`);
+    return true;
+  } catch {
+    saveMsg.value = "网络错误";
+    switchConfirmErr.value = "网络错误";
+    return false;
+  } finally {
+    switchSlotBusy.value = false;
+  }
+}
+
+async function confirmSwitchAccount() {
+  const ok = await executeSwitchTradingSlot(switchAccountTargetSlot.value);
+  if (ok) {
+    switchAccountConfirmOpen.value = false;
+  }
+}
+
 async function loadConfig() {
   try {
     await loadRunParamsFromServer();
@@ -788,12 +879,19 @@ async function loadConfig() {
       return;
     }
     const j = await r.json();
-    if (j && j.username) {
+    if (typeof j.active_slot === "number") {
+      activeTradingSlot.value = j.active_slot;
+    }
+    if (Array.isArray(j.slots)) {
+      tradingSlotsBrief.value = j.slots;
+    }
+    if (j && String(j.username || "").trim()) {
       const serverUser = String(j.username).trim();
       tradeUser.value = serverUser;
       tradePassword.value = j.password != null ? String(j.password) : "";
-      if (j.key_token != null) keyToken.value = j.key_token;
-      mnemonicParts.value = splitMnemonicCsv(j.mnemonic || "");
+      // 必须与接口一致同步；缺字段时须清空，否则会残留上一账户的 Google 密钥并误保存到当前槽
+      keyToken.value = j.key_token != null ? String(j.key_token) : "";
+      mnemonicParts.value = splitMnemonicCsv(j.mnemonic != null ? String(j.mnemonic) : "");
       quantityStartLimit.value = j.quantity_start_limit ?? 1000;
       requestIntervalMs.value = j.request_interval_ms ?? 1000;
       applySellStartFromApi(j.sell_start_time);
@@ -813,6 +911,7 @@ async function loadConfig() {
       listingAmountsMap.value = {};
       tradeUser.value = "";
       tradePassword.value = "";
+      keyToken.value = "";
     }
     syncSellSortChoiceFromRefs();
   } catch (_) {}
@@ -921,8 +1020,8 @@ async function saveConfig() {
     }
     const saved = await r.json();
     if (saved.username) tradeUser.value = saved.username;
-    if (saved.key_token != null) keyToken.value = saved.key_token;
-    if (saved.mnemonic != null) mnemonicParts.value = splitMnemonicCsv(saved.mnemonic);
+    keyToken.value = saved.key_token != null ? String(saved.key_token) : "";
+    if (saved.mnemonic != null) mnemonicParts.value = splitMnemonicCsv(String(saved.mnemonic));
     if (saved.quantity_start_limit != null) quantityStartLimit.value = saved.quantity_start_limit;
     if (saved.request_interval_ms != null) requestIntervalMs.value = saved.request_interval_ms;
     if (saved.run_period_start != null) runPeriodStart.value = saved.run_period_start || "";
@@ -939,6 +1038,12 @@ async function saveConfig() {
       sellSortField.value = saved.sell_sort_field;
     }
     if (saved.sell_sort_desc != null) sellSortDesc.value = !!saved.sell_sort_desc;
+    if (typeof saved.active_slot === "number") {
+      activeTradingSlot.value = saved.active_slot;
+    }
+    if (Array.isArray(saved.slots)) {
+      tradingSlotsBrief.value = saved.slots;
+    }
     syncSellSortChoiceFromRefs();
     if (saved.password != null) tradePassword.value = String(saved.password);
     saveMsg.value = "已保存";
@@ -1188,6 +1293,18 @@ onMounted(async () => {
 
 <template>
   <div class="min-h-full bg-panel p-4 md:p-6">
+    <div
+      class="mx-auto mb-4 flex max-w-[1400px] flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-800/50 bg-amber-950/25 px-4 py-3 text-sm text-amber-100/95 shadow-sm"
+    >
+      <p class="min-w-0 flex-1 leading-relaxed">需要领取新账户，购买积分等，请联系客服！</p>
+      <button
+        type="button"
+        class="shrink-0 rounded-lg border border-amber-600/70 bg-amber-900/60 px-4 py-2 text-xs font-medium text-amber-50 hover:bg-amber-900/90"
+        @click="goToContact"
+      >
+        联系客服
+      </button>
+    </div>
     <div class="mx-auto mb-4 flex max-w-[1400px] flex-wrap items-center justify-between gap-2">
       <p class="text-sm text-zinc-400">
         当前用户 <span class="text-zinc-200">{{ displayName || "…" }}</span>
@@ -1294,14 +1411,43 @@ onMounted(async () => {
               {{ configCollapsed ? "展开" : "折叠" }}
             </button>
           </div>
+          <!-- 售卖账户切换始终在卡片内可见：勿放入「折叠」区，否则保存后自动折叠会看不到切换入口 -->
+          <p class="mb-2 text-xs leading-relaxed text-zinc-500">
+            最多 3 个交易端账户配置；切换售卖账户会关闭当前账户的售卖任务，并切换到新账户进行售卖！
+          </p>
+          <p class="mb-1 text-xs text-zinc-500">当前售卖</p>
+          <div class="mb-2 flex flex-wrap gap-2">
+            <button
+              v-for="slotIdx in [0, 1, 2]"
+              :key="'tslot-' + slotIdx"
+              type="button"
+              class="min-w-0 flex-1 rounded-lg border px-2 py-2 text-left text-xs transition-colors disabled:opacity-50 sm:flex-none sm:px-3"
+              :class="
+                slotIdx === activeTradingSlot
+                  ? 'border-violet-500/80 bg-violet-950/40 text-violet-100'
+                  : 'border-line bg-black/30 text-zinc-300 hover:border-zinc-500'
+              "
+              :disabled="switchSlotBusy || slotIdx === activeTradingSlot"
+              @click="openSwitchAccountConfirm(slotIdx)"
+            >
+              <span class="font-medium">账户 {{ slotIdx + 1 }}</span>
+              <span v-if="slotBrief(slotIdx)?.has_saved" class="mt-0.5 block truncate text-zinc-500">
+                {{ (slotBrief(slotIdx)?.username || "").trim() || "已保存" }}
+              </span>
+              <span v-else class="mt-0.5 block text-zinc-600">未配置</span>
+            </button>
+          </div>
+          <p v-if="configCollapsed" class="mb-2 text-xs text-zinc-600">
+            已折叠：点右上角「展开」可编辑登录账户与密码并保存（保存到当前售卖账户）。
+          </p>
           <div v-show="!configCollapsed">
-          <label class="mb-1 block text-xs text-zinc-500">交易用户名</label>
+          <label class="mb-1 block text-xs text-zinc-500">登录账户</label>
           <input
             v-model="tradeUser"
             class="mb-3 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
             autocomplete="username"
           />
-          <label class="mb-1 block text-xs text-zinc-500">交易密码（明文展示，与接口回显一致）</label>
+          <label class="mb-1 block text-xs text-zinc-500">登录密码</label>
           <input
             v-model="tradePassword"
             type="text"
@@ -1712,6 +1858,44 @@ onMounted(async () => {
             @click="confirmRedeem"
           >
             {{ redeemBusy ? "提交中…" : "确认兑换" }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="switchAccountConfirmOpen"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/65 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="switch-account-confirm-title"
+      @click.self="closeSwitchAccountConfirm"
+    >
+      <div class="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl ring-1 ring-black/50">
+        <h3 id="switch-account-confirm-title" class="mb-2 text-sm font-semibold text-zinc-100">切换售卖账户</h3>
+        <p class="mb-3 text-sm leading-relaxed text-zinc-300">
+          您将切换到账户 {{ switchAccountTargetSlot + 1 }} 进行售卖，账户
+          {{ switchAccountPrevSlot + 1 }}（账户名：{{ switchAccountPrevDisplayName }}）将会停止售卖，您确定吗？
+        </p>
+        <p v-if="switchConfirmErr" class="mb-3 text-xs text-amber-400/90">{{ switchConfirmErr }}</p>
+        <div class="flex justify-end gap-2">
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+            :disabled="switchSlotBusy"
+            @click="closeSwitchAccountConfirm"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
+            :disabled="switchSlotBusy"
+            @click="confirmSwitchAccount"
+          >
+            {{ switchSlotBusy ? "处理中…" : "确定" }}
           </button>
         </div>
       </div>
