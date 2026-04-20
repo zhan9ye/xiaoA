@@ -6,7 +6,14 @@ import json
 import time
 from typing import Any, Dict, List, Tuple
 
-from Tea.exceptions import TeaException
+try:
+    from Tea.exceptions import TeaException
+except ModuleNotFoundError as e:  # pragma: no cover
+    raise ImportError(
+        "缺少阿里云 Python SDK 依赖包 Tea（模块名 Tea）。请在服务器 venv 中执行："
+        "pip install 'alibabacloud-tea>=0.3,<1' 或重新 pip install -r requirements.txt"
+    ) from e
+
 from alibabacloud_ecs20140526 import models as ecs_models
 from alibabacloud_ecs20140526.client import Client as EcsClient
 from alibabacloud_tea_openapi import models as open_api_models

@@ -10,4 +10,6 @@ bcrypt>=4.1
 PyJWT>=2.8
 pyotp>=2.9
 cryptography>=42.0.0
+# ECS SDK 的传递依赖在部分环境可能未装上，显式声明以保证存在 Tea 模块
+alibabacloud-tea>=0.3,<1
 alibabacloud-ecs20140526>=4.4,<5
