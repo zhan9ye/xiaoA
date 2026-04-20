@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 
 const LS_ADMIN = "admin_access_token";
 
@@ -26,6 +26,33 @@ const pwdModal = ref({ open: false, userId: null, username: "", value: "" });
 const ptsModal = ref({ open: false, userId: null, username: "", value: "" });
 const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "" });
 const poolEditModal = ref({ open: false, id: null, label: "", proxy_url: "" });
+
+/** 阿里云 ECS 管理端测试（按启动模板创建 / 释放） */
+const ecsTestAmount = ref(1);
+const ecsTestBusy = ref(false);
+const ecsDeleteId = ref("");
+const ecsDeleteBusy = ref(false);
+const ecsLastIds = ref([]);
+
+/** ECS 实例列表（与代理池关联） */
+const ecsList = ref([]);
+const ecsListErr = ref("");
+const ecsListLoading = ref(false);
+const ecsPage = ref(1);
+const ecsPageSize = ref(20);
+const ecsTotal = ref(0);
+const ecsAddPoolBusyId = ref("");
+const ecsLockBusyId = ref("");
+const ecsReleaseBusyId = ref("");
+const poolDeleteBusyId = ref(null);
+
+/** 当前列表里是否显示为锁定（仅当前页；释放时后端仍会强校验） */
+const ecsDeleteLocked = computed(() => {
+  const id = ecsDeleteId.value.trim();
+  if (!id) return false;
+  const hit = ecsList.value.find((e) => e.instance_id === id);
+  return Boolean(hit && hit.locked);
+});
 
 function headers() {
   return {
@@ -71,7 +98,187 @@ function adminLogout() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadUsers(), loadProxyPool()]);
+  await Promise.all([loadUsers(), loadProxyPool(), loadEcsList()]);
+}
+
+async function loadEcsList() {
+  ecsListErr.value = "";
+  ecsListLoading.value = true;
+  try {
+    const r = await fetch(
+      `/api/admin/aliyun-ecs/instances?page=${ecsPage.value}&page_size=${ecsPageSize.value}`,
+      { headers: headers() },
+    );
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (r.status === 503) {
+      ecsList.value = [];
+      ecsTotal.value = 0;
+      const j = await r.json().catch(() => ({}));
+      ecsListErr.value = typeof j.detail === "string" ? j.detail : "未配置阿里云或不可用";
+      return;
+    }
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      ecsListErr.value = typeof j.detail === "string" ? j.detail : "加载 ECS 列表失败";
+      ecsList.value = [];
+      ecsTotal.value = 0;
+      return;
+    }
+    const j = await r.json();
+    ecsList.value = Array.isArray(j.instances) ? j.instances : [];
+    ecsTotal.value = Number(j.total_count) || 0;
+  } catch {
+    ecsListErr.value = "网络错误";
+    ecsList.value = [];
+    ecsTotal.value = 0;
+  } finally {
+    ecsListLoading.value = false;
+  }
+}
+
+function ecsHasNextPage() {
+  return ecsPage.value * ecsPageSize.value < ecsTotal.value;
+}
+
+async function ecsGoPrevPage() {
+  if (ecsPage.value <= 1) return;
+  ecsPage.value -= 1;
+  await loadEcsList();
+}
+
+async function ecsGoNextPage() {
+  if (!ecsHasNextPage()) return;
+  ecsPage.value += 1;
+  await loadEcsList();
+}
+
+function canAddPoolForEcs(row) {
+  return !row.pool_entry_id && (row.public_ip || "").trim().length > 0;
+}
+
+async function releaseEcsInstance(row) {
+  if (row.locked) return;
+  if (
+    !window.confirm(
+      `确定释放并删除 ECS「${row.instance_id}」？将解绑/删除对应代理池条目并调用阿里云删除，不可恢复。`,
+    )
+  ) {
+    return;
+  }
+  actionMsg.value = "";
+  ecsReleaseBusyId.value = row.instance_id;
+  try {
+    const r = await fetch("/api/admin/aliyun-ecs/delete-instance", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ instance_id: row.instance_id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "释放失败";
+      return;
+    }
+    const rm = Array.isArray(j.removed_pool_entry_ids) ? j.removed_pool_entry_ids : [];
+    const ub = Array.isArray(j.unbound_user_ids) ? j.unbound_user_ids : [];
+    const parts = [`已释放 ECS：${row.instance_id}；RequestId=${j.request_id || ""}`];
+    if (rm.length) parts.push(`已删代理池 #${rm.join(", #")}`);
+    if (ub.length) parts.push(`已解绑用户 id：${ub.join(", ")}`);
+    actionMsg.value = parts.join(" | ");
+    await Promise.all([loadProxyPool(), loadEcsList()]);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    ecsReleaseBusyId.value = "";
+  }
+}
+
+async function toggleEcsLock(row) {
+  actionMsg.value = "";
+  const next = !row.locked;
+  ecsLockBusyId.value = row.instance_id;
+  try {
+    const r = await fetch("/api/admin/aliyun-ecs/instance-lock", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify({ instance_id: row.instance_id, locked: next }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "锁定操作失败";
+      return;
+    }
+    actionMsg.value = next ? `已锁定实例 ${row.instance_id}` : `已取消锁定 ${row.instance_id}`;
+    await loadEcsList();
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    ecsLockBusyId.value = "";
+  }
+}
+
+async function addPoolEntryForEcs(row) {
+  if (!canAddPoolForEcs(row)) return;
+  actionMsg.value = "";
+  ecsAddPoolBusyId.value = row.instance_id;
+  try {
+    const r = await fetch("/api/admin/aliyun-ecs/proxy-pool-entry", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ instance_id: row.instance_id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "补录失败";
+      return;
+    }
+    actionMsg.value = `已补录代理池 #${j.pool_entry_id}（${j.proxy_url || ""}）`;
+    await Promise.all([loadProxyPool(), loadEcsList()]);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    ecsAddPoolBusyId.value = "";
+  }
+}
+
+async function deleteProxyPoolEntry(p) {
+  if (!window.confirm(`确定删除代理池条目 #${p.id}？若已绑定用户将解绑并失效其出站会话。`)) return;
+  actionMsg.value = "";
+  poolDeleteBusyId.value = p.id;
+  try {
+    const r = await fetch(`/api/admin/proxy-pool/${p.id}`, { method: "DELETE", headers: headers() });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "删除失败";
+      return;
+    }
+    actionMsg.value =
+      j.unbound_user_id != null ? `已删除代理池 #${p.id}，已解绑用户 #${j.unbound_user_id}` : `已删除代理池 #${p.id}`;
+    await Promise.all([loadProxyPool(), loadEcsList()]);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    poolDeleteBusyId.value = null;
+  }
 }
 
 async function loadProxyPool() {
@@ -252,6 +459,91 @@ async function releaseProxyEntry(row) {
   }
   actionMsg.value = `已释放 #${row.id}`;
   await refreshAll();
+}
+
+async function adminEcsRunTest() {
+  actionMsg.value = "";
+  const n = Math.max(1, Math.min(10, Number(ecsTestAmount.value) || 1));
+  ecsTestBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/aliyun-ecs/run-instances", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ amount: n }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "创建失败";
+      return;
+    }
+    ecsLastIds.value = Array.isArray(j.instance_ids) ? j.instance_ids : [];
+    const added = Array.isArray(j.pool_entries_added) ? j.pool_entries_added : [];
+    const skipIp = Array.isArray(j.pool_skipped_no_public_ip) ? j.pool_skipped_no_public_ip : [];
+    const skipDup = Array.isArray(j.pool_skipped_duplicate_url) ? j.pool_skipped_duplicate_url : [];
+    const parts = [
+      `ECS 创建成功：${ecsLastIds.value.join(", ") || "(无返回 ID)"}；RequestId=${j.request_id || ""}`,
+    ];
+    if (added.length) {
+      parts.push(
+        `已加入出站代理池 ${added.length} 条：` +
+          added.map((x) => `#${x.pool_entry_id} ${x.label || ""} (${x.proxy_url || ""})`).join("；"),
+      );
+    }
+    if (skipIp.length) parts.push(`未拿到公网 IP（未入库）：${skipIp.join(", ")}`);
+    if (skipDup.length) parts.push(`代理 URL 已存在（跳过）：${skipDup.join(", ")}`);
+    actionMsg.value = parts.join(" | ");
+    await Promise.all([loadProxyPool(), loadEcsList()]);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    ecsTestBusy.value = false;
+  }
+}
+
+async function adminEcsDeleteTest() {
+  actionMsg.value = "";
+  const iid = ecsDeleteId.value.trim();
+  if (!iid) {
+    actionMsg.value = "请填写实例 ID";
+    return;
+  }
+  if (ecsDeleteLocked.value) {
+    actionMsg.value = "该实例在当前列表中标记为已锁定，禁止释放。请先取消锁定。";
+    return;
+  }
+  ecsDeleteBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/aliyun-ecs/delete-instance", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ instance_id: iid }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "释放失败";
+      return;
+    }
+    const rm = Array.isArray(j.removed_pool_entry_ids) ? j.removed_pool_entry_ids : [];
+    const ub = Array.isArray(j.unbound_user_ids) ? j.unbound_user_ids : [];
+    const parts = [`已提交释放 ECS：${iid}；RequestId=${j.request_id || ""}`];
+    if (rm.length) parts.push(`已删代理池条目 #${rm.join(", #")}`);
+    if (ub.length) parts.push(`已解绑用户 id：${ub.join(", ")}`);
+    actionMsg.value = parts.join(" | ");
+    ecsDeleteId.value = "";
+    await Promise.all([loadProxyPool(), loadEcsList()]);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    ecsDeleteBusy.value = false;
+  }
 }
 
 async function toggleProxyActive(row) {
@@ -488,15 +780,16 @@ onMounted(() => {
           <button
             type="button"
             class="rounded-lg border border-zinc-600 bg-zinc-800/50 px-3 py-1.5 text-xs hover:bg-zinc-800"
-            :disabled="listLoading || poolLoading"
+            :disabled="listLoading || poolLoading || ecsListLoading"
             @click="refreshAll"
           >
             刷新列表
           </button>
-          <span v-if="listLoading || poolLoading" class="text-xs text-zinc-500">加载中…</span>
+          <span v-if="listLoading || poolLoading || ecsListLoading" class="text-xs text-zinc-500">加载中…</span>
         </div>
         <p v-if="listErr" class="mb-2 text-xs text-amber-400">{{ listErr }}</p>
         <p v-if="poolErr" class="mb-2 text-xs text-amber-400">{{ poolErr }}</p>
+        <p v-if="ecsListErr" class="mb-2 text-xs text-amber-400">{{ ecsListErr }}</p>
         <p v-if="actionMsg" class="mb-2 text-xs text-emerald-400/90">{{ actionMsg }}</p>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">出站代理池</h2>
@@ -578,6 +871,14 @@ onMounted(() => {
                       >
                         释放绑定
                       </button>
+                      <button
+                        type="button"
+                        class="rounded border border-rose-900/50 px-1.5 py-0.5 text-rose-400/90 hover:bg-rose-950/30 disabled:opacity-40"
+                        :disabled="poolDeleteBusyId === p.id"
+                        @click="deleteProxyPoolEntry(p)"
+                      >
+                        {{ poolDeleteBusyId === p.id ? "删除中…" : "删除" }}
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -585,6 +886,200 @@ onMounted(() => {
             </table>
             <p v-if="!poolLoading && proxyEntries.length === 0" class="px-3 py-4 text-center text-zinc-500">暂无池条目</p>
           </div>
+        </div>
+
+        <h2 class="mb-2 text-sm font-medium text-zinc-300">ECS 实例列表</h2>
+        <p class="mb-3 text-xs text-zinc-500">
+          当前地域分页展示；若实例在出站代理池中无对应条目（按实例 ID 标签或 <code class="text-zinc-400">http://公网IP:3128</code> 匹配），且已有公网
+          IP，可点击「补录代理池」。
+        </p>
+        <div class="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+          <div class="mb-2 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <span>共 {{ ecsTotal }} 台</span>
+            <span>·</span>
+            <span>第 {{ ecsPage }} 页</span>
+            <button
+              type="button"
+              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
+              :disabled="ecsPage <= 1 || ecsListLoading"
+              @click="ecsGoPrevPage"
+            >
+              上一页
+            </button>
+            <button
+              type="button"
+              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
+              :disabled="!ecsHasNextPage() || ecsListLoading"
+              @click="ecsGoNextPage"
+            >
+              下一页
+            </button>
+            <button
+              type="button"
+              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800"
+              :disabled="ecsListLoading"
+              @click="loadEcsList"
+            >
+              刷新 ECS
+            </button>
+          </div>
+          <div class="overflow-x-auto rounded-lg border border-zinc-800/80">
+            <table class="w-full min-w-[720px] border-collapse text-left text-sm">
+              <thead>
+                <tr class="border-b border-zinc-800 text-xs text-zinc-500">
+                  <th class="w-14 px-2 py-3 font-medium" scope="col">
+                    <span class="sr-only">锁定</span>
+                  </th>
+                  <th class="px-3 py-3 font-medium">实例 ID</th>
+                  <th class="px-3 py-3 font-medium">状态</th>
+                  <th class="px-3 py-3 font-medium">可用区</th>
+                  <th class="px-3 py-3 font-medium">公网 IP</th>
+                  <th class="px-3 py-3 font-medium">代理池</th>
+                  <th class="min-w-[17rem] px-3 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="e in ecsList" :key="e.instance_id" class="border-b border-zinc-800/80 hover:bg-white/[0.02]">
+                  <td class="px-2 py-3 align-middle text-center">
+                    <button
+                      type="button"
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-lg border transition-colors disabled:opacity-40"
+                      :class="
+                        e.locked
+                          ? 'border-amber-700/60 bg-amber-950/40 text-amber-300 hover:bg-amber-950/60'
+                          : 'border-zinc-600 bg-zinc-900/50 text-zinc-400 hover:border-zinc-500 hover:bg-zinc-800 hover:text-zinc-200'
+                      "
+                      :disabled="ecsLockBusyId === e.instance_id"
+                      :title="e.locked ? '已锁定：点击取消锁定' : '未锁定：点击锁定（禁止误释放）'"
+                      @click="toggleEcsLock(e)"
+                    >
+                      <!-- 已锁定：闭合锁 -->
+                      <svg
+                        v-if="e.locked"
+                        class="h-5 w-5"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"
+                        />
+                      </svg>
+                      <!-- 未锁定：开锁 -->
+                      <svg v-else class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M12 17c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6-9h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h1.9c0-1.71 1.39-3.1 3.1-3.1S16 4.29 16 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm0 12H6V10h12v10z"
+                        />
+                      </svg>
+                    </button>
+                  </td>
+                  <td class="px-3 py-3 align-middle font-mono text-xs text-zinc-300">{{ e.instance_id }}</td>
+                  <td class="px-3 py-3 align-middle text-sm text-zinc-300">{{ e.status || "—" }}</td>
+                  <td class="px-3 py-3 align-middle font-mono text-xs text-zinc-500">{{ e.zone_id || "—" }}</td>
+                  <td class="px-3 py-3 align-middle font-mono text-xs text-zinc-400">{{ e.public_ip || "—" }}</td>
+                  <td class="px-3 py-3 align-middle text-sm">
+                    <span v-if="e.pool_entry_id" class="text-emerald-500/90">
+                      #{{ e.pool_entry_id }}
+                      <span v-if="e.pool_match" class="text-xs text-zinc-500">（{{ e.pool_match }}）</span>
+                    </span>
+                    <span v-else class="text-zinc-600">无</span>
+                  </td>
+                  <td class="px-3 py-3 align-middle">
+                    <div class="flex flex-row flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        class="shrink-0 rounded-lg border border-rose-800/70 bg-rose-950/45 px-2.5 py-1.5 text-xs font-medium text-rose-100 hover:bg-rose-950/75 disabled:cursor-not-allowed disabled:opacity-40"
+                        :disabled="e.locked || ecsReleaseBusyId === e.instance_id"
+                        :title="e.locked ? '已锁定，不可释放' : '释放实例并清理代理池'"
+                        @click="releaseEcsInstance(e)"
+                      >
+                        {{ ecsReleaseBusyId === e.instance_id ? "释放中…" : "释放" }}
+                      </button>
+                      <button
+                        type="button"
+                        class="shrink-0 rounded-lg border border-cyan-800/60 bg-cyan-950/40 px-2.5 py-1.5 text-xs font-medium text-cyan-100 hover:bg-cyan-950/70 disabled:cursor-not-allowed disabled:opacity-40"
+                        :disabled="!canAddPoolForEcs(e) || ecsAddPoolBusyId === e.instance_id"
+                        @click="addPoolEntryForEcs(e)"
+                      >
+                        {{
+                          ecsAddPoolBusyId === e.instance_id
+                            ? "提交中…"
+                            : !e.public_ip
+                              ? "无公网 IP"
+                              : e.pool_entry_id
+                                ? "已有条目"
+                                : "补录代理池"
+                        }}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="!ecsListLoading && ecsList.length === 0 && !ecsListErr" class="px-3 py-4 text-center text-zinc-500">
+              暂无实例或未配置阿里云
+            </p>
+          </div>
+        </div>
+
+        <h2 class="mb-2 text-sm font-medium text-zinc-300">阿里云 ECS（测试）</h2>
+        <p class="mb-3 text-xs text-zinc-500">
+          使用 <code class="text-zinc-400">.env</code> 中的
+          <code class="text-zinc-400">ALIYUN_*</code> 与
+          <code class="text-zinc-400">ALIYUN_ECS_LAUNCH_TEMPLATE_*</code>，按启动模板调用
+          <code class="text-zinc-400">RunInstances</code> /
+          <code class="text-zinc-400">DeleteInstance(force)</code>。创建会产生按量费用，请小步验证。
+        </p>
+        <div class="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+          <div class="mb-3 flex flex-wrap items-end gap-2">
+            <div class="w-24">
+              <label class="mb-1 block text-xs text-zinc-500">数量</label>
+              <input
+                v-model.number="ecsTestAmount"
+                type="number"
+                min="1"
+                max="10"
+                class="w-full rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 font-mono text-xs outline-none ring-rose-500/40 focus:ring-2"
+              />
+            </div>
+            <button
+              type="button"
+              class="rounded-lg border border-cyan-800/60 bg-cyan-950/50 px-3 py-2 text-xs text-cyan-100 hover:bg-cyan-950/80 disabled:opacity-50"
+              :disabled="ecsTestBusy"
+              @click="adminEcsRunTest"
+            >
+              {{ ecsTestBusy ? "创建中…" : "创建 ECS（测试）" }}
+            </button>
+          </div>
+          <div class="mb-2 flex flex-wrap items-end gap-2">
+            <div class="min-w-[200px] flex-1 font-mono">
+              <label class="mb-1 block text-xs text-zinc-500">实例 ID</label>
+              <input
+                v-model="ecsDeleteId"
+                type="text"
+                placeholder="i-xxxxxxxxxxxxxxxxx"
+                class="w-full rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 text-xs outline-none ring-rose-500/40 focus:ring-2"
+              />
+              <p v-if="ecsDeleteLocked" class="mt-1 text-xs text-amber-400/90">
+                当前列表中该实例为「已锁定」，不可在此释放；请先在上表取消锁定。
+              </p>
+            </div>
+            <button
+              type="button"
+              class="rounded-lg border border-rose-800/60 bg-rose-950/50 px-3 py-2 text-xs text-rose-100 hover:bg-rose-950/80 disabled:opacity-50"
+              :disabled="ecsDeleteBusy || ecsDeleteLocked"
+              @click="adminEcsDeleteTest"
+            >
+              {{ ecsDeleteBusy ? "提交中…" : "释放 ECS（测试）" }}
+            </button>
+          </div>
+          <p class="mb-2 text-xs text-zinc-500">
+            主程序等非代理 ECS 请在实例列表中点击「锁定」；锁定后即使填写实例 ID 也无法通过本页释放（后端同步校验）。
+          </p>
+          <p v-if="ecsLastIds.length" class="text-xs text-zinc-500">
+            上次创建返回：
+            <span class="font-mono text-zinc-300">{{ ecsLastIds.join(", ") }}</span>
+          </p>
         </div>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">平台用户</h2>

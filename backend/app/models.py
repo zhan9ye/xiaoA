@@ -42,6 +42,14 @@ class User(Base):
     subscription_end_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime(), nullable=True)
 
 
+class AdminEcsInstanceLock(Base):
+    """管理端标记：锁定的 ECS 禁止走「释放 ECS」接口（如主程序服务器）。"""
+
+    __tablename__ = "admin_ecs_instance_locks"
+
+    instance_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+
 class ProxyPoolEntry(Base):
     """
     出站 HTTP(S) 代理池（如自建 ECS Squid）。assigned_user_id 为空表示空闲；

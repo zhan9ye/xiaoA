@@ -526,3 +526,97 @@ class AdminUserProxyIn(BaseModel):
     """pool_entry_id 为 null 表示解除该用户绑定；否则绑定到指定池条目（须空闲或已属于该用户）。"""
 
     pool_entry_id: Optional[int] = None
+
+
+class AdminAliyunRunInstancesIn(BaseModel):
+    """管理端测试：按 .env 中启动模板创建 ECS（小步验证）。"""
+
+    amount: int = Field(default=1, ge=1, le=10, description="创建数量，建议先 1")
+
+
+class AdminAliyunPoolEntryAdded(BaseModel):
+    """创建 ECS 后自动写入出站代理池的条目。"""
+
+    pool_entry_id: int
+    instance_id: str
+    proxy_url: str
+    label: str
+
+
+class AdminAliyunRunInstancesOut(BaseModel):
+    ok: bool = True
+    instance_ids: List[str] = Field(default_factory=list)
+    request_id: str = ""
+    pool_entries_added: List[AdminAliyunPoolEntryAdded] = Field(default_factory=list)
+    pool_skipped_no_public_ip: List[str] = Field(
+        default_factory=list,
+        description="超时仍未拿到公网/EIP，未写入代理池的实例 ID",
+    )
+    pool_skipped_duplicate_url: List[str] = Field(
+        default_factory=list,
+        description="proxy_url 已在池中存在，跳过的实例 ID",
+    )
+
+
+class AdminAliyunDeleteInstanceIn(BaseModel):
+    """管理端测试：释放（删除）指定实例 ID。"""
+
+    instance_id: str = Field(..., min_length=1, description="ECS 实例 ID，如 i-xxx")
+
+
+class AdminAliyunDeleteInstanceOut(BaseModel):
+    ok: bool = True
+    request_id: str = ""
+    removed_pool_entry_ids: List[int] = Field(default_factory=list, description="已删除的代理池条目 id")
+    unbound_user_ids: List[int] = Field(default_factory=list, description="因解绑代理而失效出站会话的用户 id")
+
+
+class AdminAliyunEcsInstanceRow(BaseModel):
+    """管理端 ECS 列表单行（与代理池关联状态）。"""
+
+    instance_id: str
+    status: str = ""
+    instance_name: str = ""
+    zone_id: str = ""
+    public_ip: str = ""
+    locked: bool = Field(default=False, description="锁定后禁止管理端释放该实例")
+    pool_entry_id: Optional[int] = None
+    pool_match: Optional[str] = Field(
+        default=None,
+        description="与代理池的匹配方式：label=实例ID、proxy_url=公网IP:3128；无条目为 null",
+    )
+
+
+class AdminAliyunEcsInstanceLockIn(BaseModel):
+    instance_id: str = Field(..., min_length=1, description="ECS 实例 ID")
+    locked: bool = Field(..., description="true 锁定，false 取消锁定")
+
+
+class AdminAliyunEcsInstanceLockOut(BaseModel):
+    ok: bool = True
+    instance_id: str
+    locked: bool
+
+
+class AdminAliyunEcsListOut(BaseModel):
+    page: int = 1
+    page_size: int = 50
+    total_count: int = 0
+    request_id: str = ""
+    instances: List[AdminAliyunEcsInstanceRow] = Field(default_factory=list)
+
+
+class AdminAliyunEcsPoolEntryFromInstanceIn(BaseModel):
+    instance_id: str = Field(..., min_length=1, description="ECS 实例 ID")
+
+
+class AdminAliyunEcsPoolEntryFromInstanceOut(BaseModel):
+    ok: bool = True
+    pool_entry_id: int
+    proxy_url: str
+    label: str
+
+
+class AdminProxyPoolDeleteOut(BaseModel):
+    ok: bool = True
+    unbound_user_id: Optional[int] = Field(default=None, description="删除前已绑定用户则返回其 id")

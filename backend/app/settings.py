@@ -83,5 +83,12 @@ class Settings(BaseSettings):
     # 若对端证书链不完整导致 [SSL: CERTIFICATE_VERIFY_FAILED]，可先设 false 权宜（存在中间人风险）。
     outbound_tls_verify: bool = True  # OUTBOUND_TLS_VERIFY
 
+    # 阿里云 ECS（管理端测试：按启动模板创建/释放实例；密钥勿提交仓库）
+    aliyun_access_key_id: str = ""
+    aliyun_access_key_secret: str = ""
+    aliyun_region_id: str = ""
+    aliyun_ecs_launch_template_id: str = ""
+    aliyun_ecs_launch_template_version: str = ""
+
 
 settings = Settings()
