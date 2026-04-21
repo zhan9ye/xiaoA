@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { onMounted, ref } from "vue";
 
 const LS_ADMIN = "admin_access_token";
 
@@ -27,11 +27,9 @@ const ptsModal = ref({ open: false, userId: null, username: "", value: "" });
 const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "" });
 const poolEditModal = ref({ open: false, id: null, label: "", proxy_url: "" });
 
-/** 阿里云 ECS 管理端测试（按启动模板创建 / 释放） */
+/** 阿里云 ECS：按启动模板创建（测试） */
 const ecsTestAmount = ref(1);
 const ecsTestBusy = ref(false);
-const ecsDeleteId = ref("");
-const ecsDeleteBusy = ref(false);
 const ecsLastIds = ref([]);
 
 /** ECS 实例列表（与代理池关联） */
@@ -45,14 +43,6 @@ const ecsAddPoolBusyId = ref("");
 const ecsLockBusyId = ref("");
 const ecsReleaseBusyId = ref("");
 const poolDeleteBusyId = ref(null);
-
-/** 当前列表里是否显示为锁定（仅当前页；释放时后端仍会强校验） */
-const ecsDeleteLocked = computed(() => {
-  const id = ecsDeleteId.value.trim();
-  if (!id) return false;
-  const hit = ecsList.value.find((e) => e.instance_id === id);
-  return Boolean(hit && hit.locked);
-});
 
 function headers() {
   return {
@@ -504,48 +494,6 @@ async function adminEcsRunTest() {
   }
 }
 
-async function adminEcsDeleteTest() {
-  actionMsg.value = "";
-  const iid = ecsDeleteId.value.trim();
-  if (!iid) {
-    actionMsg.value = "请填写实例 ID";
-    return;
-  }
-  if (ecsDeleteLocked.value) {
-    actionMsg.value = "该实例在当前列表中标记为已锁定，禁止释放。请先取消锁定。";
-    return;
-  }
-  ecsDeleteBusy.value = true;
-  try {
-    const r = await fetch("/api/admin/aliyun-ecs/delete-instance", {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify({ instance_id: iid }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.status === 401) {
-      adminLogout();
-      return;
-    }
-    if (!r.ok) {
-      actionMsg.value = typeof j.detail === "string" ? j.detail : "释放失败";
-      return;
-    }
-    const rm = Array.isArray(j.removed_pool_entry_ids) ? j.removed_pool_entry_ids : [];
-    const ub = Array.isArray(j.unbound_user_ids) ? j.unbound_user_ids : [];
-    const parts = [`已提交释放 ECS：${iid}；RequestId=${j.request_id || ""}`];
-    if (rm.length) parts.push(`已删代理池条目 #${rm.join(", #")}`);
-    if (ub.length) parts.push(`已解绑用户 id：${ub.join(", ")}`);
-    actionMsg.value = parts.join(" | ");
-    ecsDeleteId.value = "";
-    await Promise.all([loadProxyPool(), loadEcsList()]);
-  } catch {
-    actionMsg.value = "网络错误";
-  } finally {
-    ecsDeleteBusy.value = false;
-  }
-}
-
 async function toggleProxyActive(row) {
   actionMsg.value = "";
   const r = await fetch(`/api/admin/proxy-pool/${row.id}`, {
@@ -890,39 +838,68 @@ onMounted(() => {
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">ECS 实例列表</h2>
         <p class="mb-3 text-xs text-zinc-500">
-          当前地域分页展示；若实例在出站代理池中无对应条目（按实例 ID 标签或 <code class="text-zinc-400">http://公网IP:3128</code> 匹配），且已有公网
-          IP，可点击「补录代理池」。
+          当前地域分页展示。右上角可按 <code class="text-zinc-400">.env</code> 中
+          <code class="text-zinc-400">ALIYUN_*</code> 与
+          <code class="text-zinc-400">ALIYUN_ECS_LAUNCH_TEMPLATE_*</code> 调用
+          <code class="text-zinc-400">RunInstances</code> 创建实例（按量计费，请小步验证）。主程序等非代理机器请点首列锁图标锁定，以免误点「释放」。若实例在出站代理池中无对应条目（按实例 ID 标签或
+          <code class="text-zinc-400">http://公网IP:3128</code> 匹配），且已有公网 IP，可点击「补录代理池」。
         </p>
         <div class="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-          <div class="mb-2 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-            <span>共 {{ ecsTotal }} 台</span>
-            <span>·</span>
-            <span>第 {{ ecsPage }} 页</span>
-            <button
-              type="button"
-              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
-              :disabled="ecsPage <= 1 || ecsListLoading"
-              @click="ecsGoPrevPage"
-            >
-              上一页
-            </button>
-            <button
-              type="button"
-              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
-              :disabled="!ecsHasNextPage() || ecsListLoading"
-              @click="ecsGoNextPage"
-            >
-              下一页
-            </button>
-            <button
-              type="button"
-              class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800"
-              :disabled="ecsListLoading"
-              @click="loadEcsList"
-            >
-              刷新 ECS
-            </button>
+          <div class="mb-2 flex flex-wrap items-end justify-between gap-3">
+            <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+              <span>共 {{ ecsTotal }} 台</span>
+              <span>·</span>
+              <span>第 {{ ecsPage }} 页</span>
+              <button
+                type="button"
+                class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
+                :disabled="ecsPage <= 1 || ecsListLoading"
+                @click="ecsGoPrevPage"
+              >
+                上一页
+              </button>
+              <button
+                type="button"
+                class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800 disabled:opacity-40"
+                :disabled="!ecsHasNextPage() || ecsListLoading"
+                @click="ecsGoNextPage"
+              >
+                下一页
+              </button>
+              <button
+                type="button"
+                class="rounded border border-zinc-600 px-2 py-0.5 hover:bg-zinc-800"
+                :disabled="ecsListLoading"
+                @click="loadEcsList"
+              >
+                刷新 ECS
+              </button>
+            </div>
+            <div class="flex flex-wrap items-end gap-2">
+              <div class="w-24">
+                <label class="mb-1 block text-xs text-zinc-500">创建数量</label>
+                <input
+                  v-model.number="ecsTestAmount"
+                  type="number"
+                  min="1"
+                  max="10"
+                  class="w-full rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 font-mono text-xs outline-none ring-cyan-500/40 focus:ring-2"
+                />
+              </div>
+              <button
+                type="button"
+                class="rounded-lg border border-cyan-800/60 bg-cyan-950/50 px-3 py-2 text-xs text-cyan-100 hover:bg-cyan-950/80 disabled:opacity-50"
+                :disabled="ecsTestBusy"
+                @click="adminEcsRunTest"
+              >
+                {{ ecsTestBusy ? "创建中…" : "创建 ECS（测试）" }}
+              </button>
+            </div>
           </div>
+          <p v-if="ecsLastIds.length" class="mb-2 text-xs text-zinc-500">
+            上次创建返回：
+            <span class="font-mono text-zinc-300">{{ ecsLastIds.join(", ") }}</span>
+          </p>
           <div class="overflow-x-auto rounded-lg border border-zinc-800/80">
             <table class="w-full min-w-[720px] border-collapse text-left text-sm">
               <thead>
@@ -1020,66 +997,6 @@ onMounted(() => {
               暂无实例或未配置阿里云
             </p>
           </div>
-        </div>
-
-        <h2 class="mb-2 text-sm font-medium text-zinc-300">阿里云 ECS（测试）</h2>
-        <p class="mb-3 text-xs text-zinc-500">
-          使用 <code class="text-zinc-400">.env</code> 中的
-          <code class="text-zinc-400">ALIYUN_*</code> 与
-          <code class="text-zinc-400">ALIYUN_ECS_LAUNCH_TEMPLATE_*</code>，按启动模板调用
-          <code class="text-zinc-400">RunInstances</code> /
-          <code class="text-zinc-400">DeleteInstance(force)</code>。创建会产生按量费用，请小步验证。
-        </p>
-        <div class="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-          <div class="mb-3 flex flex-wrap items-end gap-2">
-            <div class="w-24">
-              <label class="mb-1 block text-xs text-zinc-500">数量</label>
-              <input
-                v-model.number="ecsTestAmount"
-                type="number"
-                min="1"
-                max="10"
-                class="w-full rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 font-mono text-xs outline-none ring-rose-500/40 focus:ring-2"
-              />
-            </div>
-            <button
-              type="button"
-              class="rounded-lg border border-cyan-800/60 bg-cyan-950/50 px-3 py-2 text-xs text-cyan-100 hover:bg-cyan-950/80 disabled:opacity-50"
-              :disabled="ecsTestBusy"
-              @click="adminEcsRunTest"
-            >
-              {{ ecsTestBusy ? "创建中…" : "创建 ECS（测试）" }}
-            </button>
-          </div>
-          <div class="mb-2 flex flex-wrap items-end gap-2">
-            <div class="min-w-[200px] flex-1 font-mono">
-              <label class="mb-1 block text-xs text-zinc-500">实例 ID</label>
-              <input
-                v-model="ecsDeleteId"
-                type="text"
-                placeholder="i-xxxxxxxxxxxxxxxxx"
-                class="w-full rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 text-xs outline-none ring-rose-500/40 focus:ring-2"
-              />
-              <p v-if="ecsDeleteLocked" class="mt-1 text-xs text-amber-400/90">
-                当前列表中该实例为「已锁定」，不可在此释放；请先在上表取消锁定。
-              </p>
-            </div>
-            <button
-              type="button"
-              class="rounded-lg border border-rose-800/60 bg-rose-950/50 px-3 py-2 text-xs text-rose-100 hover:bg-rose-950/80 disabled:opacity-50"
-              :disabled="ecsDeleteBusy || ecsDeleteLocked"
-              @click="adminEcsDeleteTest"
-            >
-              {{ ecsDeleteBusy ? "提交中…" : "释放 ECS（测试）" }}
-            </button>
-          </div>
-          <p class="mb-2 text-xs text-zinc-500">
-            主程序等非代理 ECS 请在实例列表中点击「锁定」；锁定后即使填写实例 ID 也无法通过本页释放（后端同步校验）。
-          </p>
-          <p v-if="ecsLastIds.length" class="text-xs text-zinc-500">
-            上次创建返回：
-            <span class="font-mono text-zinc-300">{{ ecsLastIds.join(", ") }}</span>
-          </p>
         </div>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">平台用户</h2>
