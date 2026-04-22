@@ -89,6 +89,7 @@ from app.services.selling_eligibility import (
 from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
 from app.proxy_binding import get_session_manager_for_user_id
+from app.runner_lifecycle import apply_timed_sell_late_start_skip_flag
 from app.rpc_v import compute_js_timespan_v
 from app.trading_config_repo import (
     ensure_trading_config_loaded,
@@ -185,21 +186,6 @@ async def _app_config_out(db: AsyncSession, user_id: int, st) -> AppConfigOut:
     )
 
 
-def _apply_timed_sell_late_start_skip_flag(st, cfg: Optional[AppConfigIn]) -> None:
-    """
-    配置了 sell_start_time 且当前已超过「开售整点 + sell_start_missed_grace_minutes」时，
-    标记本北京日仅内部等待，runner 不调登录/子账号/助记词/售卖等对外接口。
-    """
-    if cfg is None or not (cfg.sell_start_time or "").strip():
-        st.runner_late_start_skip_outbound_today = ""
-        return
-    g = max(0, int(settings.sell_start_missed_grace_minutes or 10))
-    if timed_sell_past_grace_deadline(cfg.sell_start_time, g):
-        st.runner_late_start_skip_outbound_today = beijing_today_str()
-    else:
-        st.runner_late_start_skip_outbound_today = ""
-
-
 async def _resume_runner_tasks() -> None:
     """进程启动后恢复 runner_enabled=true 的任务。"""
     from sqlalchemy import select
@@ -234,7 +220,7 @@ async def _resume_runner_tasks() -> None:
         st.loaded_config_slot = act_slot
         st.stop_event = asyncio.Event()
         st.runner_must_refresh_trading_cache = True
-        _apply_timed_sell_late_start_skip_flag(st, cfg)
+        apply_timed_sell_late_start_skip_flag(st, cfg)
         st.runner_task = asyncio.create_task(run_background(uid, cfg))
 
 
@@ -926,7 +912,7 @@ async def run_start(
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
     st.hot_sell_window_active = False
-    _apply_timed_sell_late_start_skip_flag(st, st.config)
+    apply_timed_sell_late_start_skip_flag(st, st.config)
     st.runner_task = asyncio.create_task(run_background(user.id, st.config))
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()

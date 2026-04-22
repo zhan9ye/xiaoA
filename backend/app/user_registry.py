@@ -25,20 +25,33 @@ async def get_or_create_log_hub(user_id: int) -> LogHub:
         return _hubs[user_id]
 
 
+def _normalize_proxy_label(proxy_label: Optional[str]) -> Optional[str]:
+    t = (proxy_label or "").strip()
+    return t or None
+
+
 async def get_or_create_session_manager(
     user_id: int,
     proxy_url: Optional[str] = None,
+    *,
+    proxy_label: Optional[str] = None,
 ) -> SessionManager:
-    """proxy_url 与内存中已存在实例不一致时会关闭旧 client 并重建（例如首次领到池内代理）。"""
+    """proxy_url / proxy_label 与内存中已存在实例不一致时会关闭旧 client 并重建（例如首次领到池内代理）。"""
     desired = normalize_proxy_url(proxy_url)
+    desired_label = _normalize_proxy_label(proxy_label)
     async with _lock:
         cur = _managers.get(user_id)
         if cur is not None:
             prev = getattr(cur, "_proxy_url", None)
-            if prev == desired:
+            prev_label = getattr(cur, "_proxy_label", None)
+            if prev == desired and prev_label == desired_label:
                 return cur
             await cur.close()
-        _managers[user_id] = SessionManager(proxy_url=desired, platform_user_id=user_id)
+        _managers[user_id] = SessionManager(
+            proxy_url=desired,
+            platform_user_id=user_id,
+            proxy_label=desired_label,
+        )
         return _managers[user_id]
 
 

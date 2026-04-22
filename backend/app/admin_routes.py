@@ -48,9 +48,17 @@ from app.services.aliyun_ecs_ops import (
     list_ecs_instances_page_sync,
     run_instances_then_poll_public_ips_sync,
 )
+from app.runner_lifecycle import (
+    cancel_running_runner_task_keep_enabled,
+    restart_runner_if_enabled_after_proxy_change,
+)
 from app.services.session_manager import normalize_proxy_url
 from app.settings import settings
-from app.user_registry import invalidate_user_outbound_session, remove_user_runtime
+from app.user_registry import (
+    get_or_create_state,
+    invalidate_user_outbound_session,
+    remove_user_runtime,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -452,11 +460,14 @@ async def admin_set_user_proxy(
         raise HTTPException(status_code=404, detail="用户不存在")
 
     if body.pool_entry_id is None:
+        st = await get_or_create_state(user_id)
+        was_running = await cancel_running_runner_task_keep_enabled(st)
         r = await db.execute(select(ProxyPoolEntry).where(ProxyPoolEntry.assigned_user_id == user_id))
         for old in r.scalars().all():
             old.assigned_user_id = None
         await db.commit()
         await invalidate_user_outbound_session(user_id)
+        await restart_runner_if_enabled_after_proxy_change(db, user_id, was_running)
         return {"ok": True, "pool_entry_id": None}
 
     entry = await db.get(ProxyPoolEntry, body.pool_entry_id)
@@ -467,6 +478,8 @@ async def admin_set_user_proxy(
     if entry.assigned_user_id is not None and entry.assigned_user_id != user_id:
         raise HTTPException(status_code=400, detail="该代理已被其他用户占用")
 
+    st = await get_or_create_state(user_id)
+    was_running = await cancel_running_runner_task_keep_enabled(st)
     r2 = await db.execute(select(ProxyPoolEntry).where(ProxyPoolEntry.assigned_user_id == user_id))
     for old in r2.scalars().all():
         if old.id != entry.id:
@@ -474,6 +487,7 @@ async def admin_set_user_proxy(
     entry.assigned_user_id = user_id
     await db.commit()
     await invalidate_user_outbound_session(user_id)
+    await restart_runner_if_enabled_after_proxy_change(db, user_id, was_running)
     return {"ok": True, "pool_entry_id": entry.id}
 
 

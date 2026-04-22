@@ -31,8 +31,14 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
 class SessionManager:
     """复用 httpx.AsyncClient，在登录后持有 Cookie，供后续 RPC 使用。可选固定出站 HTTP(S) 代理。"""
 
-    def __init__(self, proxy_url: Optional[str] = None, platform_user_id: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        proxy_url: Optional[str] = None,
+        platform_user_id: Optional[int] = None,
+        proxy_label: Optional[str] = None,
+    ) -> None:
         self._proxy_url = normalize_proxy_url(proxy_url)
+        self._proxy_label = (proxy_label or "").strip() or None
         self._platform_user_id = platform_user_id
         self._client: Optional[httpx.AsyncClient] = None
         self._lock = asyncio.Lock()
@@ -55,9 +61,16 @@ class SessionManager:
                     and http_request_log_file_ok()
                 ):
                     uid = self._platform_user_id
+                    plab = self._proxy_label
+                    uses_proxy = bool(self._proxy_url)
 
                     async def _response_log_hook(response: httpx.Response) -> None:
-                        await httpx_outbound_response_log_hook(response, platform_user_id=uid)
+                        await httpx_outbound_response_log_hook(
+                            response,
+                            platform_user_id=uid,
+                            proxy_label=plab,
+                            uses_outbound_proxy=uses_proxy,
+                        )
 
                     kw["event_hooks"] = {"response": [_response_log_hook]}
                 self._client = httpx.AsyncClient(**kw)

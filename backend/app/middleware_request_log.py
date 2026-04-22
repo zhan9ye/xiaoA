@@ -1,6 +1,6 @@
 """
 出站 HTTP（httpx）文件日志：仅当请求主机匹配配置列表（默认 akapi1.com，含 www.akapi1.com）时记录。
-每条带 platform_user_id（控制台用户）。请求体仍记录；响应体仅在失败时记录（HTTP 非 2xx 或 JSON Error=true），成功写 (omitted, success)。
+每条带 platform_user_id（控制台用户）及 proxy_label（代理池条目的 label；直连为 direct；有代理但未填 label 为 (empty)）。请求体仍记录；响应体仅在失败时记录（HTTP 非 2xx 或 JSON Error=true），成功写 (omitted, success)。
 正文按长度截断；不做脱敏（日志文件可能含密码、token、助记词等，请限制文件权限并勿外传）。
 """
 
@@ -125,6 +125,8 @@ async def httpx_outbound_response_log_hook(
     response: httpx.Response,
     *,
     platform_user_id: Optional[int] = None,
+    proxy_label: Optional[str] = None,
+    uses_outbound_proxy: bool = False,
 ) -> None:
     if not settings.request_log_enabled:
         return
@@ -172,7 +174,13 @@ async def httpx_outbound_response_log_hook(
     except Exception:
         url_str = ""
 
-    who = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
+    uid_part = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
+    lab = (proxy_label or "").strip()
+    if uses_outbound_proxy:
+        lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
+    else:
+        lab_part = "proxy_label=direct"
+    who = f"{uid_part} | {lab_part}"
 
     lg.info(
         "%s | OUTBOUND %s %s | req_body=%s\nRESPONSE status=%s content-type=%s | body=%s",
