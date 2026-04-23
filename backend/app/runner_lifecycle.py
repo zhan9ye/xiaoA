@@ -12,7 +12,7 @@ from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_d
 from app.services.runner import run_background
 from app.settings import settings
 from app.state import AppState
-from app.trading_config_repo import ensure_trading_config_loaded
+from app.trading_config_repo import ensure_trading_config_loaded, get_active_trading_slot, persist_trading_config
 from app.user_registry import get_or_create_state
 
 
@@ -31,41 +31,50 @@ def apply_timed_sell_late_start_skip_flag(st: AppState, cfg: Optional[AppConfigI
         st.runner_late_start_skip_outbound_today = ""
 
 
-async def cancel_running_runner_task_keep_enabled(st: AppState) -> bool:
+async def runner_execute_stop(db: AsyncSession, user_id: int) -> AppState:
     """
-    取消正在运行的 run_background，不把 runner_enabled 写入 false（与用户点「停止」不同）。
-    返回是否曾处于运行中。
+    与 POST /api/run/stop 相同：runner_enabled 落库为 false，取消并等待 run_background 结束。
     """
-    if st.runner_task is None or st.runner_task.done():
-        return False
+    st = await get_or_create_state(user_id)
+    await ensure_trading_config_loaded(db, user_id, st)
+    if st.config is not None:
+        st.config = st.config.model_copy(update={"runner_enabled": False})
+        slot_a = await get_active_trading_slot(db, user_id)
+        await persist_trading_config(db, user_id, slot_a, st.config)
     st.stop_event.set()
-    st.runner_task.cancel()
-    try:
-        await st.runner_task
-    except asyncio.CancelledError:
-        pass
+    if st.runner_task is not None and not st.runner_task.done():
+        st.runner_task.cancel()
+        try:
+            await st.runner_task
+        except asyncio.CancelledError:
+            pass
     st.runner_task = None
     st.hot_sell_window_active = False
-    return True
+    return st
 
 
-async def restart_runner_if_enabled_after_proxy_change(
-    db: AsyncSession,
-    user_id: int,
-    was_running: bool,
-) -> None:
+async def runner_execute_start_core(db: AsyncSession, user_id: int, st: AppState) -> None:
     """
-    换绑出站代理后：若此前任务在跑，则按当前库内配置再起 run_background（与 run_start 一致，但不重复 persist runner_enabled）。
+    与 POST /api/run/start 中「真正启动」段相同。
+    前置：已 ensure_trading_config_loaded；无运行中 runner_task；st.config 非空。
     """
-    if not was_running:
+    cfg = st.config
+    if cfg is None:
         return
-    st = await get_or_create_state(user_id)
-    if not await ensure_trading_config_loaded(db, user_id, st):
+    if st.runner_task is not None and not st.runner_task.done():
         return
-    if st.config is None or not st.config.runner_enabled:
-        return
+    st.config = cfg.model_copy(update={"runner_enabled": True})
+    slot_a = await get_active_trading_slot(db, user_id)
+    await persist_trading_config(db, user_id, slot_a, st.config)
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
     st.hot_sell_window_active = False
     apply_timed_sell_late_start_skip_flag(st, st.config)
     st.runner_task = asyncio.create_task(run_background(user_id, st.config))
+
+
+def should_restart_runner_like_frontend_after_proxy_rebind(st: AppState) -> bool:
+    """runner_enabled 为开且 asyncio 任务正在跑（售卖中），换绑后需先停再起，与前端一致。"""
+    if st.config is None or not st.config.runner_enabled:
+        return False
+    return st.runner_task is not None and not st.runner_task.done()

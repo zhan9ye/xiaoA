@@ -49,9 +49,11 @@ from app.services.aliyun_ecs_ops import (
     run_instances_then_poll_public_ips_sync,
 )
 from app.runner_lifecycle import (
-    cancel_running_runner_task_keep_enabled,
-    restart_runner_if_enabled_after_proxy_change,
+    runner_execute_start_core,
+    runner_execute_stop,
+    should_restart_runner_like_frontend_after_proxy_rebind,
 )
+from app.trading_config_repo import ensure_trading_config_loaded
 from app.services.session_manager import normalize_proxy_url
 from app.settings import settings
 from app.user_registry import (
@@ -461,13 +463,19 @@ async def admin_set_user_proxy(
 
     if body.pool_entry_id is None:
         st = await get_or_create_state(user_id)
-        was_running = await cancel_running_runner_task_keep_enabled(st)
+        await ensure_trading_config_loaded(db, user_id, st)
+        should_restart = should_restart_runner_like_frontend_after_proxy_rebind(st)
+        if should_restart:
+            await runner_execute_stop(db, user_id)
         r = await db.execute(select(ProxyPoolEntry).where(ProxyPoolEntry.assigned_user_id == user_id))
         for old in r.scalars().all():
             old.assigned_user_id = None
         await db.commit()
         await invalidate_user_outbound_session(user_id)
-        await restart_runner_if_enabled_after_proxy_change(db, user_id, was_running)
+        if should_restart:
+            st2 = await get_or_create_state(user_id)
+            await ensure_trading_config_loaded(db, user_id, st2)
+            await runner_execute_start_core(db, user_id, st2)
         return {"ok": True, "pool_entry_id": None}
 
     entry = await db.get(ProxyPoolEntry, body.pool_entry_id)
@@ -479,7 +487,10 @@ async def admin_set_user_proxy(
         raise HTTPException(status_code=400, detail="该代理已被其他用户占用")
 
     st = await get_or_create_state(user_id)
-    was_running = await cancel_running_runner_task_keep_enabled(st)
+    await ensure_trading_config_loaded(db, user_id, st)
+    should_restart = should_restart_runner_like_frontend_after_proxy_rebind(st)
+    if should_restart:
+        await runner_execute_stop(db, user_id)
     r2 = await db.execute(select(ProxyPoolEntry).where(ProxyPoolEntry.assigned_user_id == user_id))
     for old in r2.scalars().all():
         if old.id != entry.id:
@@ -487,7 +498,10 @@ async def admin_set_user_proxy(
     entry.assigned_user_id = user_id
     await db.commit()
     await invalidate_user_outbound_session(user_id)
-    await restart_runner_if_enabled_after_proxy_change(db, user_id, was_running)
+    if should_restart:
+        st2 = await get_or_create_state(user_id)
+        await ensure_trading_config_loaded(db, user_id, st2)
+        await runner_execute_start_core(db, user_id, st2)
     return {"ok": True, "pool_entry_id": entry.id}
 
 

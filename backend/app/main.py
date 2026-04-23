@@ -89,7 +89,11 @@ from app.services.selling_eligibility import (
 from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
 from app.proxy_binding import get_session_manager_for_user_id
-from app.runner_lifecycle import apply_timed_sell_late_start_skip_flag
+from app.runner_lifecycle import (
+    apply_timed_sell_late_start_skip_flag,
+    runner_execute_start_core,
+    runner_execute_stop,
+)
 from app.rpc_v import compute_js_timespan_v
 from app.trading_config_repo import (
     ensure_trading_config_loaded,
@@ -906,14 +910,7 @@ async def run_start(
     cfg = st.config
     if cfg is None:
         raise HTTPException(status_code=400, detail="请先保存配置")
-    st.config = cfg.model_copy(update={"runner_enabled": True})
-    slot_a = await get_active_trading_slot(db, user.id)
-    await persist_trading_config(db, user.id, slot_a, st.config)
-    st.stop_event = asyncio.Event()
-    st.runner_must_refresh_trading_cache = True
-    st.hot_sell_window_active = False
-    apply_timed_sell_late_start_skip_flag(st, st.config)
-    st.runner_task = asyncio.create_task(run_background(user.id, st.config))
+    await runner_execute_start_core(db, user.id, st)
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
     tio, tws = _run_status_timed_sell_flags(st)
@@ -932,21 +929,7 @@ async def run_start(
 
 @app.post("/api/run/stop")
 async def run_stop(user: User = Depends(require_active_subscription), db: AsyncSession = Depends(get_db)) -> RunStatus:
-    st = await get_or_create_state(user.id)
-    await ensure_trading_config_loaded(db, user.id, st)
-    if st.config is not None:
-        st.config = st.config.model_copy(update={"runner_enabled": False})
-        slot_a = await get_active_trading_slot(db, user.id)
-        await persist_trading_config(db, user.id, slot_a, st.config)
-    st.stop_event.set()
-    if st.runner_task is not None and not st.runner_task.done():
-        st.runner_task.cancel()
-        try:
-            await st.runner_task
-        except asyncio.CancelledError:
-            pass
-    st.runner_task = None
-    st.hot_sell_window_active = False
+    st = await runner_execute_stop(db, user.id)
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
     tio, tws = _run_status_timed_sell_flags(st)
