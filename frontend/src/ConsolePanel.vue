@@ -234,6 +234,9 @@ const SUBACCOUNT_COLUMNS_HIDDEN = new Set([
   "id",
   "Id",
   "ID",
+  "__is_main_account",
+  "HonorName",
+  "CurrentStockPrice",
   "IsMemberNo",
   "AvatarImage",
   "LevelNumber",
@@ -325,6 +328,25 @@ function resolveSonId(row) {
   return "";
 }
 
+/** 与后端 son_id_form_fields_empty 一致（RPC 卖主账户时 sonId 无值） */
+function sonIdFormFieldsEmpty(row) {
+  for (const k of ["SonId", "sonId"]) {
+    const v = row?.[k];
+    if (v != null && String(v).trim() !== "") return false;
+  }
+  return true;
+}
+
+/** 与后端 listing_amount_key_for_row 一致（挂售覆盖 JSON 的键） */
+function listingAmountKeyForRow(row) {
+  if (isMainAccountRow(row)) return "";
+  return resolveSonId(row);
+}
+
+function isMainAccountRow(row) {
+  return row?.__is_main_account === true;
+}
+
 function aceAmountStringForRow(row) {
   const n = parseAceAmount(row);
   if (n == null) return "";
@@ -334,25 +356,37 @@ function aceAmountStringForRow(row) {
 
 function listingAmountDisplay(row) {
   const fromApi = row?.ListingQty;
-  if (fromApi != null && String(fromApi).trim() !== "") return String(fromApi).trim();
-  const sid = resolveSonId(row);
+  if (fromApi != null && String(fromApi).trim() !== "") {
+    const fv = String(fromApi).trim();
+    if (fv === "0") return "不卖";
+    return fv;
+  }
   const full = aceAmountStringForRow(row);
-  if (!sid || !full) return "—";
-  const o = listingAmountsMap.value[sid];
+  if (!full) return "—";
+  const mapKey = listingAmountKeyForRow(row);
+  const o = listingAmountsMap.value[mapKey];
   if (o != null && String(o).trim() !== "") {
     const t = String(o).trim();
     if (t === "0") return "不卖";
     return t;
   }
+  if (isMainAccountRow(row)) return "不卖";
   return full;
+}
+
+function shouldShowSellTag(row) {
+  const qty = listingAmountDisplay(row);
+  if (isMainAccountRow(row)) {
+    return qty !== "不卖" && qty !== "—";
+  }
+  return isEligibleByRunParams(row) && qty !== "不卖" && qty !== "—";
 }
 
 function openListingEdit(row) {
   listingEditErr.value = "";
-  const sid = resolveSonId(row);
   const full = aceAmountStringForRow(row);
-  if (!sid || !full) return;
-  listingEditSonId.value = sid;
+  if (!full) return;
+  listingEditSonId.value = listingAmountKeyForRow(row);
   listingEditFullShares.value = full;
   listingEditInput.value = listingAmountDisplay(row);
   listingEditOpen.value = true;
@@ -376,7 +410,7 @@ function halfListingAmountFromFull(fullRaw) {
 async function patchListingAmount(amountPayload) {
   listingEditErr.value = "";
   const sid = listingEditSonId.value;
-  if (!sid) return;
+  if (!listingEditOpen.value) return;
   listingEditBusy.value = true;
   try {
     const r = await fetch("/api/config/listing-amount", {
@@ -422,6 +456,17 @@ async function applyListingHalf() {
   await patchListingAmount(halfStr);
 }
 
+async function applyListingFull() {
+  const sid = listingEditSonId.value;
+  const full = String(listingEditFullShares.value).replaceAll(",", "").trim();
+  if (!full) {
+    listingEditErr.value = "当前股数为空，无法设置卖全部";
+    return;
+  }
+  listingEditInput.value = full;
+  await patchListingAmount(sid === "" ? full : "");
+}
+
 async function submitListingEdit() {
   listingEditErr.value = "";
   const sid = listingEditSonId.value;
@@ -446,7 +491,8 @@ async function submitListingEdit() {
     return;
   }
   const sameAsFull = num > 0 && Number.isFinite(fullNum) && Math.abs(num - fullNum) < 1e-9;
-  const amountPayload = sameAsFull ? "" : num === 0 ? "0" : raw;
+  // 主账户默认清空覆盖=不卖，因此“卖全部”需写入具体数值，不能清空。
+  const amountPayload = sameAsFull ? (sid === "" ? raw : "") : num === 0 ? "0" : raw;
   await patchListingAmount(amountPayload);
 }
 
@@ -560,6 +606,9 @@ const displayedSubaccounts = computed(() => {
   for (let i = 0; i < list.length; i++) byOriginalIndex.set(list[i], i);
   const rows = [...list];
   return rows.sort((a, b) => {
+    const ma = isMainAccountRow(a) ? 0 : 1;
+    const mb = isMainAccountRow(b) ? 0 : 1;
+    if (ma !== mb) return ma - mb;
     const ea = isEligibleByRunParams(a) ? 0 : 1;
     const eb = isEligibleByRunParams(b) ? 0 : 1;
     if (ea !== eb) return ea - eb;
@@ -1720,9 +1769,9 @@ onMounted(async () => {
               <tbody>
                 <tr
                   v-for="(row, i) in displayedSubaccounts"
-                  :key="resolveSonId(row) || `r-${i}`"
+                  :key="`${listingAmountKeyForRow(row)}-${i}`"
                   class="border-b border-line/80 hover:bg-white/[0.03]"
-                  :class="isEligibleByRunParams(row) ? 'text-amber-300' : 'text-zinc-300'"
+                  :class="isMainAccountRow(row) ? 'text-cyan-300' : (isEligibleByRunParams(row) ? 'text-amber-300' : 'text-zinc-300')"
                 >
                   <td class="sticky left-0 z-10 bg-panel px-2 py-1.5 text-zinc-500">{{ i + 1 }}</td>
                   <td
@@ -1735,7 +1784,7 @@ onMounted(async () => {
                       <template v-if="isMemberNoColumnKey(lk)">
                         <span>{{ subaccountTableCell(row, lk) }}</span>
                         <span
-                          v-if="isEligibleByRunParams(row)"
+                          v-if="shouldShowSellTag(row)"
                           class="ml-0.5 inline-block shrink-0 font-medium text-emerald-500"
                           aria-label="可卖"
                         >售</span>
@@ -1764,7 +1813,7 @@ onMounted(async () => {
                     <button
                       type="button"
                       class="rounded border border-zinc-600 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-                      :disabled="!resolveSonId(row) || !aceAmountStringForRow(row)"
+                      :disabled="!aceAmountStringForRow(row)"
                       @click="openListingEdit(row)"
                     >
                       编辑
@@ -1971,7 +2020,8 @@ onMounted(async () => {
       <div class="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl ring-1 ring-black/50">
         <h3 id="listing-edit-title" class="mb-3 text-sm font-semibold text-zinc-100">修改挂售数量</h3>
         <p class="mb-2 text-xs text-zinc-500">
-          子账号 <span class="font-mono text-zinc-400">{{ listingEditSonId }}</span>
+          {{ listingEditSonId === "" ? "主账户（sonId 为空）" : "子账号" }}
+          <span v-if="listingEditSonId !== ''" class="font-mono text-zinc-400">{{ listingEditSonId }}</span>
         </p>
         <p class="mb-3 text-xs text-zinc-500">
           当前股数（默认挂售全部）：
@@ -2009,7 +2059,7 @@ onMounted(async () => {
             type="button"
             class="rounded-lg border border-zinc-600 bg-zinc-800/80 px-2 py-2 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
             :disabled="listingEditBusy"
-            @click="patchListingAmount('')"
+            @click="applyListingFull"
           >
             卖全部
           </button>

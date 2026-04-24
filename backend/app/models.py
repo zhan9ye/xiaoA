@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, TypeDecorator
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, TypeDecorator, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -108,6 +108,34 @@ class TradingConfig(Base):
     sold_son_ids_json: Mapped[str] = mapped_column(Text, default="{}")
     # {"sonId":"挂售数量"} 字符串；未出现的 sonId 表示挂售数量=全部股数（AceAmount）
     listing_amounts_json: Mapped[str] = mapped_column(Text, default="{}")
+    # {"ACECount":123,...}：主账户信息快照（来源 public_IndexData）
+    main_account_info_json: Mapped[str] = mapped_column(Text, default="{}")
     # 售卖时子账号顺序：create_time（创建日）或 ace_amount（股数）；sell_sort_desc 为 True 表示降序
     sell_sort_field: Mapped[str] = mapped_column(String(32), default="create_time")
     sell_sort_desc: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class UserOperationLog(Base):
+    """控制台用户（及管理员 JWT）对 API 的操作留痕；params_json 为脱敏后的 JSON 字符串。"""
+
+    __tablename__ = "user_operation_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    is_admin_action: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    business_summary: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    params_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    failure_reason: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)

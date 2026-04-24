@@ -25,8 +25,11 @@ class Settings(BaseSettings):
 
     login_url: str = "https://www.akapi1.com/RPC/Login"
     subaccount_url: str = "https://www.akapi1.com/RPC/My_Subaccount"
+    public_index_data_url: str = "https://www.akapi1.com/RPC/public_IndexData"
     # 子账号卖出 RPC（运行参数中的限额/时段在业务层与 AceAmount、创建日结合使用）
     ace_sell_son_url: str = "https://www.akapi1.com/RPC/ACE_Sell_Son"
+    # 主账户卖出 RPC（sonId 为空）
+    ace_sell_main_url: str = "https://www.akapi1.com/RPC/ACE_Sell"
     mnemonic_get01_url: str = "https://www.akapi1.com/RPC/Mnemonic_Get01"
 
     subaccount_page_size: int = 15

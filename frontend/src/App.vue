@@ -1,5 +1,6 @@
 <script setup>
 import { onMounted, onUnmounted, ref } from "vue";
+import AdminOperationLogsPanel from "./AdminOperationLogsPanel.vue";
 import AdminPanel from "./AdminPanel.vue";
 import ContactPage from "./ContactPage.vue";
 import ConsolePanel from "./ConsolePanel.vue";
@@ -12,7 +13,13 @@ const token = ref(typeof localStorage !== "undefined" ? localStorage.getItem(LS_
 function adminHash() {
   if (typeof window === "undefined") return false;
   const h = window.location.hash || "";
-  return h === "#/admin" || h === "#admin";
+  return h === "#/admin" || h === "#admin" || h.startsWith("#/admin/");
+}
+
+function adminOperationLogsHash() {
+  if (typeof window === "undefined") return false;
+  const h = (window.location.hash || "").toLowerCase();
+  return h === "#/admin/operation-logs" || h === "#/admin/operation-logs/";
 }
 
 function contactHash() {
@@ -22,10 +29,12 @@ function contactHash() {
 }
 
 const isAdminView = ref(adminHash());
+const isAdminOperationLogsView = ref(adminOperationLogsHash());
 const isContactView = ref(contactHash());
 
 function onHashChange() {
   isAdminView.value = adminHash();
+  isAdminOperationLogsView.value = adminOperationLogsHash();
   isContactView.value = contactHash();
 }
 
@@ -49,7 +58,8 @@ function logout() {
 </script>
 
 <template>
-  <AdminPanel v-if="isAdminView" />
+  <AdminOperationLogsPanel v-if="isAdminView && isAdminOperationLogsView" />
+  <AdminPanel v-else-if="isAdminView" />
   <template v-else-if="token">
     <ContactPage v-if="isContactView" :logged-in="true" />
     <ConsolePanel v-else :token="token" @logout="logout" />

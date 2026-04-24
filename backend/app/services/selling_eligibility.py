@@ -21,6 +21,98 @@ def resolve_son_id(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def son_id_form_fields_empty(row: Dict[str, Any]) -> bool:
+    """与 RPC 卖主账户时「sonId 无值」一致：仅看 SonId/sonId 是否都未填。"""
+    for k in ("SonId", "sonId"):
+        v = row.get(k)
+        if v is not None and str(v).strip() != "":
+            return False
+    return True
+
+
+def listing_amount_key_for_row(row: Dict[str, Any]) -> str:
+    """挂售覆盖 JSON 的键：仅主账户行用空字符串，其它行用本行账号 id。"""
+    if bool(row.get("__is_main_account")):
+        return ""
+    return resolve_son_id(row) or ""
+
+
+def ace_sell_rpc_son_id(row: Dict[str, Any]) -> str:
+    """
+    POST ACE_Sell_Son 表单里的 sonId：
+    - 主账户行（__is_main_account=true）强制空字符串；
+    - 其余优先 SonId/sonId，缺失时回退 resolve_son_id（兼容上游仅给 Id 的历史数据）。
+    """
+    if bool(row.get("__is_main_account")):
+        return ""
+    for k in ("SonId", "sonId"):
+        v = row.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return resolve_son_id(row) or ""
+
+
+def ace_sell_track_id(row: Dict[str, Any]) -> str:
+    """并发去重、已售记录、日志键：主账户固定 __main__，子账户为表单 sonId（与 ace_sell_rpc_son_id 一致）。"""
+    s = ace_sell_rpc_son_id(row)
+    return "__main__" if not s else s
+
+
+def is_main_account_row(row: Dict[str, Any]) -> bool:
+    """主账户判定：仅看显式标记，避免把缺字段子账号误判为主账户。"""
+    return bool(row.get("__is_main_account"))
+
+
+def ensure_main_account_row(items: List[Dict[str, Any]], main_account_id: str = "") -> List[Dict[str, Any]]:
+    """
+    确保列表中始终有主账户行，且位于最前。
+    约定：主账户默认股数 AceAmount=0（当上游未提供时），用于前端稳定展示。
+    """
+    rest: List[Dict[str, Any]] = []
+    for raw in items:
+        row = dict(raw)
+        if bool(row.get("__is_main_account")):
+            continue
+        rest.append(row)
+    main_id = str(main_account_id or "").strip()
+    main_row: Dict[str, Any] = {
+        "SonId": "",
+        "FlowNumber": main_id,
+        "MemberNo": "主账户",
+        "AceAmount": "0",
+        "__is_main_account": True,
+    }
+    return [main_row, *rest]
+
+
+def parse_main_account_info_json(raw: str) -> Dict[str, Any]:
+    try:
+        o = json.loads((raw or "").strip() or "{}")
+        return o if isinstance(o, dict) else {}
+    except Exception:
+        return {}
+
+
+def apply_main_account_info(row: Dict[str, Any], info: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    ace = info.get("ACECount")
+    if ace is not None and str(ace).strip() != "":
+        out["AceAmount"] = str(ace).strip()
+    if info.get("HonorName") is not None:
+        out["HonorName"] = info.get("HonorName")
+    if info.get("LevelNumber") is not None:
+        out["LevelNumber"] = info.get("LevelNumber")
+    if info.get("CurrentStockPrice") is not None:
+        out["CurrentStockPrice"] = info.get("CurrentStockPrice")
+    for k in ("EP", "RP", "SP", "ULP"):
+        if info.get(k) is not None:
+            out[k] = info.get(k)
+    ctime = info.get("CreateTime")
+    if ctime is not None and str(ctime).strip():
+        out["CreateTime"] = str(ctime).strip()
+    return out
+
+
 def resolve_subaccount_display_name(row: Dict[str, Any]) -> str:
     """子账号展示名（与前端「子账户名」MemberNo 等一致）；无则返回空串。"""
     for k in (
@@ -166,11 +258,31 @@ def parse_listing_amounts_map(json_str: str) -> Dict[str, str]:
                 continue
             sk = str(k).strip()
             sv = str(v).replace(",", "").strip()
-            if sk and sv:
-                out[sk] = sv
+            if not sv:
+                continue
+            out[sk] = sv
         return out
     except (json.JSONDecodeError, TypeError, ValueError):
         return {}
+
+
+def ensure_main_listing_default_json(json_str: str) -> Tuple[str, bool]:
+    """
+    确保挂售覆盖中存在主账户默认值："" -> "0"（不卖）。
+    返回 (new_json, changed)。
+    """
+    raw = (json_str or "").strip() or "{}"
+    try:
+        m = json.loads(raw)
+        if not isinstance(m, dict):
+            m = {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        m = {}
+    has_main = ("" in m) and str(m.get("", "")).strip() != ""
+    if has_main:
+        return json.dumps(m, ensure_ascii=False, separators=(",", ":")), False
+    m[""] = "0"
+    return json.dumps(m, ensure_ascii=False, separators=(",", ":")), True
 
 
 def listing_amounts_for_api(cfg: AppConfigIn) -> Dict[str, str]:
@@ -190,6 +302,9 @@ def effective_listing_amount_str(cfg: AppConfigIn, son_id: str, full_amount_str:
     sid = str(son_id).strip()
     v = m.get(sid)
     if v is None or v == "":
+        # 主账户（sonId 为空）默认不卖；仅当显式配置了 "" 键时才按配置值执行。
+        if sid == "":
+            return ""
         return _normalize_amount_token(full_amount_str)
     token = _normalize_amount_token(v)
     try:
@@ -230,9 +345,10 @@ def enrich_subaccounts_with_listing_qty(items: List[Dict[str, Any]], cfg: AppCon
     out: List[Dict[str, Any]] = []
     for raw in items:
         row = dict(raw)
-        son_id = resolve_son_id(row)
         full = ace_amount_string_for_rpc(row)
-        if son_id and full:
-            row["ListingQty"] = effective_listing_amount_str(cfg, son_id, full)
+        if full:
+            row["ListingQty"] = effective_listing_amount_str(cfg, listing_amount_key_for_row(row), full)
+        elif is_main_account_row(row):
+            row["ListingQty"] = "0"
         out.append(row)
     return out

@@ -155,6 +155,10 @@ class AppConfigIn(BaseModel):
         default="{}",
         description='按子账号覆盖挂售数量 JSON：{"sonId":"数量"}；缺省则挂售全部股数',
     )
+    main_account_info_json: str = Field(
+        default="{}",
+        description='主账户信息快照 JSON（来自 public_IndexData，如 {"ACECount":123}）',
+    )
     sell_sort_field: str = Field(default="create_time")
     sell_sort_desc: bool = Field(default=False)
 
@@ -226,7 +230,10 @@ class AppConfigOut(BaseModel):
 
 
 class ListingAmountPatchIn(BaseModel):
-    son_id: str = Field(..., min_length=1, description="子账号 id，与 RPC sonId 一致")
+    son_id: str = Field(
+        default="",
+        description="子账号 id，与 RPC sonId 一致；卖主账户时传空字符串",
+    )
     amount: str = Field(
         default="",
         description="挂售数量；空字符串表示恢复为全部股数（清除覆盖）；「0」表示不卖（写入覆盖，售卖层 cnt 为空）",
@@ -321,8 +328,14 @@ class AceSellSonIn(BaseModel):
     mnemonicstr1 仍由配置中 12 段数字与 mnemonic_id1 推导（mnemonic_id1 未传时以接口返回为准）。
     """
 
-    son_id: str = Field(..., min_length=1, description="子账号 id，如 4218087")
-    amount: str = Field(..., min_length=1)
+    son_id: str = Field(
+        default="",
+        description="与 RPC 表单 sonId 一致：非空=子账户；空字符串=主账户（不得以其它字段代替）",
+    )
+    amount: str = Field(
+        default="",
+        description="对应表单 amount；空则使用 count（与抓包主账户一致时可二者相同）",
+    )
     mnemonic_id1: Optional[str] = Field(
         default=None,
         description="第几段 4 位数字；不传且已调 Mnemonic_Get01 时用接口返回的 mnemonicid1",
@@ -337,7 +350,7 @@ class AceSellSonIn(BaseModel):
     )
     count: Optional[str] = Field(
         default=None,
-        description="对应表单 count；不传则尝试从已缓存子账号行匹配 son_id 的 AceAmount",
+        description="对应表单 count；不传则从缓存解析：有 son_id 时匹配该行 AceAmount；son_id 为空时匹配无主账号 id 行（主账户）",
     )
     g_code: Optional[str] = Field(
         default=None,
@@ -444,6 +457,32 @@ class RedeemPreviewOut(BaseModel):
 
     subscription_end_at: datetime
     points_cost: int
+
+
+# —— 操作日志 ——
+
+
+class OperationLogEntryOut(BaseModel):
+    id: int
+    created_at: datetime
+    username: Optional[str] = None
+    is_admin_action: bool = False
+    method: str
+    path: str
+    business_summary: str = ""
+    params_json: str
+    success: bool
+    failure_reason: Optional[str] = None
+
+
+class OperationLogListOut(BaseModel):
+    items: List[OperationLogEntryOut]
+    total: int
+
+
+class AdminOperationLogsClearOut(BaseModel):
+    ok: bool = True
+    removed: int = Field(0, description="已删除的操作日志条数")
 
 
 # —— 后台管理（.env 管理员，不入库）——

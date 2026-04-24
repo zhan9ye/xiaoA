@@ -25,8 +25,11 @@ from app.services.runner_lease import get_runner_lease_holder_id, renew_runner_l
 from app.services.rpc_auth_signals import json_indicates_rpc_not_logged_in
 from app.services.selling_eligibility import (
     ace_amount_string_for_rpc,
+    ace_sell_rpc_son_id,
+    ace_sell_track_id,
     effective_listing_amount_str,
-    resolve_son_id,
+    parse_main_account_info_json,
+    listing_amount_key_for_row,
     resolve_subaccount_display_name,
     sort_subaccounts_for_sell,
     subaccount_eligible_for_ace_sell,
@@ -258,6 +261,38 @@ async def _resolve_items_cache_or_resume_fetch(
     return await _fetch_subaccounts_resume_retries(user_id, state, log_hub, sm, cfg)
 
 
+def _runner_main_account_row(cfg: AppConfigIn) -> dict:
+    info = parse_main_account_info_json(getattr(cfg, "main_account_info_json", "") or "{}")
+    main_id = (cfg.rpc_user_id or "").strip()
+    ace = info.get("ACECount")
+    ace_str = str(ace).strip() if ace is not None and str(ace).strip() else "0"
+    row = {
+        "SonId": "",
+        "FlowNumber": main_id,
+        "MemberNo": "主账户",
+        "AceAmount": ace_str,
+        "__is_main_account": True,
+    }
+    ctime = info.get("CreateTime")
+    if ctime is not None and str(ctime).strip():
+        row["CreateTime"] = str(ctime).strip()
+    return row
+
+
+def _ensure_runner_main_account(items: List[dict], cfg: AppConfigIn) -> List[dict]:
+    # 自动售卖中：主账户强制参与，且固定置顶，避免依赖上游是否返回主账户行。
+    rest = [dict(r) for r in items if not bool(dict(r).get("__is_main_account"))]
+    return [_runner_main_account_row(cfg), *rest]
+
+
+def _runner_effective_count(cfg: AppConfigIn, row: dict) -> str:
+    full_cnt = ace_amount_string_for_rpc(row)
+    if not full_cnt:
+        return ""
+    # 主账户也遵循挂售数量配置：若为“不卖”（0/空），则不参与自动售卖。
+    return effective_listing_amount_str(cfg, listing_amount_key_for_row(row), full_cnt)
+
+
 async def _run_hot_maybe_recover_relogin(
     user_id: int,
     state: AppState,
@@ -276,7 +311,7 @@ async def _run_hot_maybe_recover_relogin(
     if cfg is None:
         return False, True
 
-    items = sort_subaccounts_for_sell(list(items), cfg)
+    items = sort_subaccounts_for_sell(_ensure_runner_main_account(list(items), cfg), cfg)
 
     if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
         await log_hub.push(LogLevel.error, "助记词缓存未就绪，无法进入 HotWindow")
@@ -323,7 +358,7 @@ async def _run_hot_maybe_recover_relogin(
     if cfg is None:
         return False, True
 
-    items2 = sort_subaccounts_for_sell(items2, cfg)
+    items2 = sort_subaccounts_for_sell(_ensure_runner_main_account(items2, cfg), cfg)
 
     if not await _ensure_sell_mnemonic_cached(state, sm, log_hub, cfg):
         state.last_runner_error = "Login 后助记词缓存失败"
@@ -555,21 +590,44 @@ async def _hot_window_sell_session(
         sold_ids = sold_son_ids_for_today(cfg.sold_son_ids_json, today)
 
         remaining_rows: List[dict] = []
+        total_rows = len(items)
+        skipped_not_eligible = 0
+        skipped_missing_son = 0
+        skipped_already_sold = 0
+        skipped_not_listed = 0
         for row in items:
-            ok_el, _ = subaccount_eligible_for_ace_sell(row, cfg)
+            is_main = bool(row.get("__is_main_account"))
+            rpc_son = ace_sell_rpc_son_id(row)
+            if is_main:
+                ok_el = True
+            else:
+                ok_el, _ = subaccount_eligible_for_ace_sell(row, cfg)
             if not ok_el:
+                skipped_not_eligible += 1
                 continue
-            son_id = resolve_son_id(row)
-            if not son_id or son_id in sold_ids:
+            if not is_main and not rpc_son:
+                skipped_missing_son += 1
                 continue
-            full_cnt = ace_amount_string_for_rpc(row)
-            cnt = effective_listing_amount_str(cfg, son_id, full_cnt) if full_cnt else ""
+            track_id = ace_sell_track_id(row)
+            if not track_id or track_id in sold_ids:
+                skipped_already_sold += 1
+                continue
+            cnt = _runner_effective_count(cfg, row)
             if not cnt:
+                skipped_not_listed += 1
                 continue
             remaining_rows.append(row)
 
         if not remaining_rows:
-            await log_hub.push(LogLevel.info, "当日待售子账号已处理完毕（无未成功且符合条件者）")
+            await log_hub.push(
+                LogLevel.info,
+                (
+                    "当日待售子账号已处理完毕：无可发起项"
+                    f"（总{total_rows}，规则不满足{skipped_not_eligible}，"
+                    f"缺少sonId{skipped_missing_son}，今日已售/无追单{skipped_already_sold}，"
+                    f"挂售不卖{skipped_not_listed}）"
+                ),
+            )
             break
 
         await log_hub.push(
@@ -613,11 +671,13 @@ async def _hot_window_sell_session(
             cfg0 = state.config
             if cfg0 is None:
                 return
-            son_id = resolve_son_id(row)
-            if not son_id:
+            track_id = ace_sell_track_id(row)
+            rpc_son_id = ace_sell_rpc_son_id(row)
+            if not bool(row.get("__is_main_account")) and not rpc_son_id:
                 return
-            full_cnt = ace_amount_string_for_rpc(row)
-            cnt = effective_listing_amount_str(cfg0, son_id, full_cnt) if full_cnt else ""
+            if not track_id:
+                return
+            cnt = _runner_effective_count(cfg0, row)
             if not cnt:
                 return
             amt = cnt
@@ -648,7 +708,7 @@ async def _hot_window_sell_session(
                 if not g:
                     await log_hub.push(
                         LogLevel.error,
-                        f"无法生成 TOTP sonId={son_id}：{g_err or '请检查 key_token'}",
+                        f"无法生成 TOTP（track={track_id}）：{g_err or '请检查 key_token'}",
                     )
                     break
 
@@ -662,7 +722,7 @@ async def _hot_window_sell_session(
                     sm,
                     amount=amt,
                     password=cfg_row.password,
-                    son_id=son_id,
+                    son_id=rpc_son_id,
                     mnemonic_id1=m_a,
                     mnemonic_key=m_b,
                     mnemonic_str1=m_c,
@@ -684,10 +744,14 @@ async def _hot_window_sell_session(
                         grace_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
                         if not logged_grace_for_son:
                             logged_grace_for_son = True
-                            sub_grace = resolve_subaccount_display_name(row) or son_id
+                            sub_grace = (
+                                "主账户"
+                                if not rpc_son_id
+                                else (resolve_subaccount_display_name(row) or track_id)
+                            )
                             await log_hub.push(
                                 LogLevel.warn,
-                                f"子账户：{sub_grace}，售卖失败，通道尚未开放！",
+                                f"{sub_grace}，售卖失败，通道尚未开放！",
                             )
                         if grace_ms > 0 and attempt < max_attempts:
                             await _sleep_between_sell_requests(state, grace_ms)
@@ -716,36 +780,53 @@ async def _hot_window_sell_session(
                 rate_limited = is_429
 
                 if ok_s and not json_err and not rate_limited:
-                    sub_ok = resolve_subaccount_display_name(row) or son_id
-                    await log_hub.push(
-                        LogLevel.success,
-                        f"恭喜子账户：{sub_ok}，售卖成功！售卖数量：{cnt}",
-                    )
+                    if not rpc_son_id:
+                        ok_msg = f"恭喜主账户，售卖成功！售卖数量：{cnt}"
+                    else:
+                        lab = resolve_subaccount_display_name(row) or track_id
+                        ok_msg = f"恭喜子账户：{lab}，售卖成功！售卖数量：{cnt}"
+                    await log_hub.push(LogLevel.success, ok_msg)
                     biz_success = True
                     break
                 if rate_limited:
-                    sub_name = resolve_subaccount_display_name(row) or son_id
+                    sub_name = (
+                        "主账户"
+                        if not rpc_son_id
+                        else (resolve_subaccount_display_name(row) or track_id)
+                    )
                     await log_hub.push(
                         LogLevel.warn,
-                        f"子账号：{sub_name}，售卖失败，限流！",
+                        f"{sub_name}，售卖失败，限流！",
                     )
                 elif json_err:
-                    sub_name = resolve_subaccount_display_name(row) or son_id
+                    sub_name = (
+                        "主账户"
+                        if not rpc_son_id
+                        else (resolve_subaccount_display_name(row) or track_id)
+                    )
                     await log_hub.push(
                         LogLevel.error,
-                        f"子账号：{sub_name}，售卖失败，参数不正确！",
+                        f"{sub_name}，售卖失败，参数不正确！",
                     )
                 elif code_s == 0:
-                    sub_name = resolve_subaccount_display_name(row) or son_id
+                    sub_name = (
+                        "主账户"
+                        if not rpc_son_id
+                        else (resolve_subaccount_display_name(row) or track_id)
+                    )
                     await log_hub.push(
                         LogLevel.error,
-                        f"子账号：{sub_name}，售卖失败，服务器没有响应！",
+                        f"{sub_name}，售卖失败，服务器没有响应！",
                     )
                 else:
-                    sub_name = resolve_subaccount_display_name(row) or son_id
+                    sub_name = (
+                        "主账户"
+                        if not rpc_son_id
+                        else (resolve_subaccount_display_name(row) or track_id)
+                    )
                     await log_hub.push(
                         LogLevel.error,
-                        f"子账户：{sub_name}，售卖失败，服务器忙！",
+                        f"{sub_name}，售卖失败，服务器忙！",
                     )
 
                 break
@@ -755,7 +836,7 @@ async def _hot_window_sell_session(
                     cfg_cur = state.config
                     if cfg_cur is None:
                         return
-                    new_json = add_sold_son_json(cfg_cur.sold_son_ids_json, today, son_id)
+                    new_json = add_sold_son_json(cfg_cur.sold_son_ids_json, today, track_id)
                     new_cfg = cfg_cur.model_copy(update={"sold_son_ids_json": new_json})
                     state.config = new_cfg
                     try:
@@ -791,25 +872,31 @@ async def _hot_window_sell_session(
                     if not t.cancelled():
                         exc = t.exception()
                         if exc is not None:
-                            await log_hub.push(LogLevel.error, f"售卖任务异常 sonId={sid_done}: {exc!r}")
+                            await log_hub.push(LogLevel.error, f"售卖任务异常 track={sid_done}: {exc!r}")
                     del active_by_son[sid_done]
                     completed_son_ids.add(sid_done)
 
             pending_rows: List[dict] = []
             for row in items:
-                ok_el, _ = subaccount_eligible_for_ace_sell(row, cfg2)
+                is_main = bool(row.get("__is_main_account"))
+                rpc_son = ace_sell_rpc_son_id(row)
+                if is_main:
+                    ok_el = True
+                else:
+                    ok_el, _ = subaccount_eligible_for_ace_sell(row, cfg2)
                 if not ok_el:
                     continue
-                son_id = resolve_son_id(row)
-                if not son_id or son_id in sold_ids2:
+                if not is_main and not rpc_son:
                     continue
-                full_cnt = ace_amount_string_for_rpc(row)
-                cnt = effective_listing_amount_str(cfg2, son_id, full_cnt) if full_cnt else ""
+                tid = ace_sell_track_id(row)
+                if not tid or tid in sold_ids2:
+                    continue
+                cnt = _runner_effective_count(cfg2, row)
                 if not cnt:
                     continue
                 pending_rows.append(row)
 
-            to_try = [r for r in pending_rows if resolve_son_id(r) not in completed_son_ids]
+            to_try = [r for r in pending_rows if ace_sell_track_id(r) not in completed_son_ids]
             if not to_try and not active_by_son:
                 break
 
@@ -817,10 +904,10 @@ async def _hot_window_sell_session(
             for row in to_try:
                 if launched >= concurrency:
                     break
-                sid = resolve_son_id(row)
-                if not sid or sid in active_by_son:
+                tid = ace_sell_track_id(row)
+                if not tid or tid in active_by_son:
                     continue
-                active_by_son[sid] = asyncio.create_task(process_row(row))
+                active_by_son[tid] = asyncio.create_task(process_row(row))
                 launched += 1
 
             await _wait_interruptible(state, wave_gap_s)

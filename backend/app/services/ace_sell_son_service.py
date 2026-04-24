@@ -4,24 +4,35 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.services.rpc_common import get_rpc_browser_headers
+from app.services.selling_eligibility import ace_sell_rpc_son_id
 from app.services.session_manager import SessionManager
 from app.settings import settings
 
 
+def _ace_amount_str_from_row(row: Dict[str, Any]) -> Optional[str]:
+    for amt_key in ("AceAmount", "ACEAmount", "aceAmount", "Ace_Count", "Count"):
+        av = row.get(amt_key)
+        if av is not None and str(av).strip():
+            return str(av).strip()
+    return None
+
+
 def resolve_count_from_subaccounts(items: List[Dict[str, Any]], son_id: str) -> Optional[str]:
-    """在子账号缓存中按子账号 id 查找数量类字段（如 AceAmount）。"""
+    """在子账号缓存中按子账号 id 查找数量类字段（如 AceAmount）；son_id 为空时解析主账户股数。"""
     target = str(son_id).strip()
     if not target:
+        for row in items:
+            if ace_sell_rpc_son_id(row):
+                continue
+            got = _ace_amount_str_from_row(row)
+            if got:
+                return got
         return None
     for row in items:
         for sid_key in ("SonId", "sonId", "Id", "ID", "SubAccountId", "SubId"):
             v = row.get(sid_key)
             if v is not None and str(v).strip() == target:
-                for amt_key in ("AceAmount", "ACEAmount", "aceAmount", "Ace_Count", "Count"):
-                    av = row.get(amt_key)
-                    if av is not None and str(av).strip():
-                        return str(av).strip()
-                return None
+                return _ace_amount_str_from_row(row)
     return None
 
 
@@ -42,14 +53,17 @@ async def post_ace_sell_son(
     lang: str = "cn",
 ) -> Tuple[bool, int, Any, str]:
     """
-    POST ACE_Sell_Son（application/x-www-form-urlencoded）。
+    POST ACE_Sell_Son / ACE_Sell（application/x-www-form-urlencoded）。
+    sonId 为空时走主账户接口 ACE_Sell；非空走子账户接口 ACE_Sell_Son。
     须在已 Login 的同一会话 client 上调用以携带 Cookie。
     """
     client = await sm.client()
+    son = str(son_id).strip()
+    target_url = settings.ace_sell_main_url if not son else settings.ace_sell_son_url
     data = {
         "amount": str(amount),
         "password": str(password),
-        "sonId": str(son_id),
+        "sonId": son,
         "mnemonicid1": str(mnemonic_id1),
         "mnemonickey": str(mnemonic_key),
         "mnemonicstr1": str(mnemonic_str1),
@@ -62,7 +76,7 @@ async def post_ace_sell_son(
     }
     try:
         r = await client.post(
-            settings.ace_sell_son_url,
+            target_url,
             headers=get_rpc_browser_headers(),
             data=data,
         )

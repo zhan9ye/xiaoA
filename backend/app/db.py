@@ -57,6 +57,10 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE trading_configs ADD COLUMN listing_amounts_json TEXT DEFAULT '{}'"
                 )
+            if "main_account_info_json" not in cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE trading_configs ADD COLUMN main_account_info_json TEXT DEFAULT '{}'"
+                )
             if "sell_sort_field" not in cols:
                 await conn.exec_driver_sql(
                     "ALTER TABLE trading_configs ADD COLUMN sell_sort_field VARCHAR(32) DEFAULT 'create_time'"
@@ -83,7 +87,7 @@ async def init_db() -> None:
                         user_id, slot, username, password_enc, key_token_enc, mnemonic_enc,
                         rpc_login_key_enc, rpc_user_id, rpc_version, quantity_start_limit,
                         request_interval_ms, run_period_start, run_period_end, runner_enabled,
-                        sell_start_time, sold_son_ids_json, listing_amounts_json,
+                        sell_start_time, sold_son_ids_json, listing_amounts_json, main_account_info_json,
                         sell_sort_field, sell_sort_desc
                     )
                     SELECT
@@ -104,6 +108,7 @@ async def init_db() -> None:
                         COALESCE(sell_start_time, ''),
                         COALESCE(sold_son_ids_json, '{}'),
                         COALESCE(listing_amounts_json, '{}'),
+                        '{}',
                         COALESCE(sell_sort_field, 'create_time'),
                         COALESCE(sell_sort_desc, 0)
                     FROM trading_configs_old
@@ -133,4 +138,14 @@ async def init_db() -> None:
             if "active_trading_slot" not in ucols:
                 await conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN active_trading_slot INTEGER NOT NULL DEFAULT 0"
+                )
+
+            try:
+                op_rows = (await conn.exec_driver_sql("PRAGMA table_info(user_operation_logs)")).fetchall()
+            except Exception:
+                op_rows = []
+            op_cols = {str(r[1]) for r in op_rows}
+            if op_rows and "business_summary" not in op_cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE user_operation_logs ADD COLUMN business_summary VARCHAR(256) NOT NULL DEFAULT ''"
                 )

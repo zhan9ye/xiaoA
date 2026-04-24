@@ -6,10 +6,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth_crypto import hash_password, verify_password
@@ -17,7 +17,7 @@ from app.admin_routes import router as admin_router
 from app.auth_jwt import create_access_token
 from app.db import AsyncSessionLocal, get_db, init_db
 from app.deps_auth import get_current_user, require_active_subscription
-from app.models import TradingConfig, User
+from app.models import TradingConfig, User, UserOperationLog
 from app.schemas import (
     AceSellSonIn,
     AceSellSonOut,
@@ -40,6 +40,8 @@ from app.schemas import (
     RedeemDaysIn,
     RedeemDaysOut,
     RedeemPreviewOut,
+    OperationLogEntryOut,
+    OperationLogListOut,
     TokenOut,
     UserLoginIn,
     UserPublic,
@@ -59,6 +61,7 @@ from app.services.mnemonic_segments import derive_mnemonic_str1
 from app.services.log_hub import LogLevel
 from app.services.login_response_parse import merge_from_rpc_login
 from app.services.login_service import rpc_login
+from app.services.public_index_service import extract_main_account_info, post_public_index_data
 from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_deadline
 from app.services.runner import run_background
 from app.services.subaccount_service import FetchSubaccountsOutcome, fetch_all_subaccounts
@@ -82,12 +85,17 @@ from app.services.login_bruteforce import (
     verify_login_captcha,
 )
 from app.services.selling_eligibility import (
+    apply_main_account_info,
+    ensure_main_listing_default_json,
     effective_listing_amount_str,
+    ensure_main_account_row,
     enrich_subaccounts_with_listing_qty,
     listing_amounts_for_api,
+    parse_main_account_info_json,
 )
 from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
+from app.operation_log_middleware import OperationLogMiddleware
 from app.proxy_binding import get_session_manager_for_user_id
 from app.runner_lifecycle import (
     apply_timed_sell_late_start_skip_flag,
@@ -256,6 +264,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(OperationLogMiddleware)
 @app.get("/api/health")
 async def health():
     return {"ok": True}
@@ -682,6 +691,8 @@ async def trade_ace_sell_son(
     amount = (body.amount or "").strip()
     if count_auto:
         amount = count
+    if not amount:
+        amount = count
     uid = cfg.rpc_user_id.strip()
     rk = cfg.rpc_login_key.strip()
     ver_rpc = compute_js_timespan_v()
@@ -770,7 +781,17 @@ async def list_subaccounts(
 ):
     st = await get_or_create_state(user.id)
     await ensure_trading_config_loaded(db, user.id, st)
-    items = list(st.subaccounts_cache or [])
+    if st.config is not None:
+        listing_json, changed = ensure_main_listing_default_json(st.config.listing_amounts_json)
+        if changed:
+            st.config = st.config.model_copy(update={"listing_amounts_json": listing_json})
+            slot_a = await get_active_trading_slot(db, user.id)
+            await persist_trading_config(db, user.id, slot_a, st.config)
+    main_id = (st.config.rpc_user_id or "").strip() if st.config is not None else ""
+    items = ensure_main_account_row(list(st.subaccounts_cache or []), main_account_id=main_id)
+    if st.config is not None and items:
+        info = parse_main_account_info_json(st.config.main_account_info_json)
+        items[0] = apply_main_account_info(items[0], info)
     if st.config is not None:
         items = enrich_subaccounts_with_listing_qty(items, st.config)
     return SubaccountsOut(count=len(items), items=items)
@@ -790,6 +811,12 @@ async def refresh_subaccounts(
     cfg = st.config
     if cfg is None:
         raise HTTPException(status_code=400, detail="请先保存交易配置")
+    listing_json, changed = ensure_main_listing_default_json(cfg.listing_amounts_json)
+    if changed:
+        cfg = cfg.model_copy(update={"listing_amounts_json": listing_json})
+        st.config = cfg
+        slot_a = await get_active_trading_slot(db, user.id)
+        await persist_trading_config(db, user.id, slot_a, cfg)
     sm = await get_session_manager_for_user_id(user.id)
 
     rk = cfg.rpc_login_key.strip()
@@ -839,8 +866,28 @@ async def refresh_subaccounts(
             raise HTTPException(status_code=400, detail="Login 未解析出 Key/UserID，无法拉取子账号")
         sub_out = await fetch_subs(rk, uid)
 
-    items = sub_out.items
-    st.subaccounts_cache = list(items)
+    main_id = (cfg.rpc_user_id or "").strip() if cfg is not None else ""
+    items = ensure_main_account_row(sub_out.items, main_account_id=main_id)
+    v_idx = compute_js_timespan_v()
+    ok_idx, code_idx, parsed_idx, _ = await post_public_index_data(
+        sm,
+        key=rk,
+        user_id=uid,
+        v=v_idx,
+        lang="cn",
+    )
+    if ok_idx and code_idx == 200:
+        info = extract_main_account_info(parsed_idx)
+        if info is not None:
+            prev_info = parse_main_account_info_json((cfg.main_account_info_json or "").strip() or "{}")
+            merged_info = dict(prev_info)
+            merged_info.update(info)
+            cfg = cfg.model_copy(update={"main_account_info_json": json.dumps(merged_info, ensure_ascii=False)})
+            st.config = cfg
+            slot_a = await get_active_trading_slot(db, user.id)
+            await persist_trading_config(db, user.id, slot_a, cfg)
+            items[0] = apply_main_account_info(items[0], merged_info)
+    st.subaccounts_cache = list(sub_out.items)
     cfg_out = st.config
     enriched = enrich_subaccounts_with_listing_qty(list(items), cfg_out) if cfg_out is not None else list(items)
     return SubaccountsOut(count=len(enriched), items=enriched)
@@ -944,6 +991,42 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
         timed_sell_would_skip_outbound_if_started=tws,
         subaccount_controls_locked=subaccount_controls_locked(st),
     )
+
+
+@app.get("/api/operation-logs/me", response_model=OperationLogListOut)
+async def operation_logs_me(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> OperationLogListOut:
+    filt_uid = UserOperationLog.user_id == user.id
+    filt_admin = UserOperationLog.is_admin_action.is_(False)
+    cq = select(func.count()).select_from(UserOperationLog).where(filt_uid, filt_admin)
+    q = (
+        select(UserOperationLog)
+        .where(filt_uid, filt_admin)
+        .order_by(UserOperationLog.created_at.desc())
+    )
+    total = int((await db.execute(cq)).scalar_one() or 0)
+    r = await db.execute(q.limit(limit).offset(offset))
+    rows = list(r.scalars().all())
+    items = [
+        OperationLogEntryOut(
+            id=row.id,
+            created_at=row.created_at,
+            username=user.username,
+            is_admin_action=bool(row.is_admin_action),
+            method=row.method,
+            path=row.path,
+            business_summary=getattr(row, "business_summary", None) or "",
+            params_json=row.params_json or "{}",
+            success=bool(row.success),
+            failure_reason=row.failure_reason,
+        )
+        for row in rows
+    ]
+    return OperationLogListOut(items=items, total=total)
 
 
 @app.websocket("/ws/logs")

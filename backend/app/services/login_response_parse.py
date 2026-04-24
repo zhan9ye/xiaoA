@@ -46,11 +46,25 @@ def merge_from_rpc_login(cfg: AppConfigIn, response_body: str) -> Tuple[AppConfi
     updates: dict = {"rpc_user_id": new_uid}
     if new_key:
         updates["rpc_login_key"] = new_key
+    # 登录响应里若有 UserData.CreateTime，写入主账户快照，供列表展示主账户创建时间。
+    prev_info_raw = (cfg.main_account_info_json or "").strip() or "{}"
+    try:
+        prev_info = json.loads(prev_info_raw)
+        if not isinstance(prev_info, dict):
+            prev_info = {}
+    except Exception:
+        prev_info = {}
+    ctime = ud.get("CreateTime")
+    if ctime is not None and str(ctime).strip():
+        prev_info["CreateTime"] = str(ctime).strip()
+    updates["main_account_info_json"] = json.dumps(prev_info, ensure_ascii=False)
 
     merged = cfg.model_copy(update=updates)
     prev_lk = (cfg.rpc_login_key or "").strip()
     new_lk = (merged.rpc_login_key or "").strip()
     prev_u = (cfg.rpc_user_id or "").strip()
     new_u = (merged.rpc_user_id or "").strip()
-    changed = (prev_u != new_u) or (prev_lk != new_lk)
+    prev_main = (cfg.main_account_info_json or "").strip()
+    new_main = (merged.main_account_info_json or "").strip()
+    changed = (prev_u != new_u) or (prev_lk != new_lk) or (prev_main != new_main)
     return merged, changed

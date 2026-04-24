@@ -5,14 +5,14 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth_crypto import hash_password, verify_password
 from app.auth_jwt import create_admin_access_token
 from app.db import get_db
 from app.deps_admin import is_admin_auth_configured, require_admin
-from app.models import AdminEcsInstanceLock, ProxyPoolEntry, User
+from app.models import AdminEcsInstanceLock, ProxyPoolEntry, User, UserOperationLog
 from app.schemas import (
     AdminAliyunDeleteInstanceIn,
     AdminAliyunDeleteInstanceOut,
@@ -39,6 +39,9 @@ from app.schemas import (
     AdminUserListOut,
     AdminUserProxyIn,
     AdminUserRow,
+    AdminOperationLogsClearOut,
+    OperationLogEntryOut,
+    OperationLogListOut,
     UserPublic,
 )
 from app.services.aliyun_ecs_ops import (
@@ -620,3 +623,70 @@ async def admin_delete_user(
     await db.delete(user)
     await db.commit()
     return {"ok": True, "user_id": user_id}
+
+
+async def _username_map_for_user_ids(db: AsyncSession, user_ids: set[int]) -> dict[int, str]:
+    if not user_ids:
+        return {}
+    r = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
+    return {int(i): str(n) for i, n in r.all()}
+
+
+@router.post("/operation-logs/clear", response_model=AdminOperationLogsClearOut)
+async def admin_clear_operation_logs(
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminOperationLogsClearOut:
+    """清空库中全部用户操作日志（user_operation_logs）。"""
+    res = await db.execute(delete(UserOperationLog))
+    await db.commit()
+    rc = getattr(res, "rowcount", None)
+    removed = int(rc) if rc is not None and rc >= 0 else 0
+    return AdminOperationLogsClearOut(ok=True, removed=removed)
+
+
+@router.get("/operation-logs", response_model=OperationLogListOut)
+async def admin_list_operation_logs(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    username: Optional[str] = Query(None, description="按登录名精确筛选；不传返回全部"),
+    user_id: Optional[int] = Query(None, description="按平台用户 id 筛选（与 username 二选一优先 username）"),
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> OperationLogListOut:
+    uid_filter: Optional[int] = None
+    uname = (username or "").strip()
+    if uname:
+        ur = await db.execute(select(User.id).where(User.username == uname).limit(1))
+        uid_filter = ur.scalar_one_or_none()
+        if uid_filter is None:
+            return OperationLogListOut(items=[], total=0)
+    elif user_id is not None:
+        uid_filter = int(user_id)
+
+    cq = select(func.count()).select_from(UserOperationLog)
+    q = select(UserOperationLog).order_by(UserOperationLog.created_at.desc())
+    if uid_filter is not None:
+        cq = cq.where(UserOperationLog.user_id == uid_filter)
+        q = q.where(UserOperationLog.user_id == uid_filter)
+    total = int((await db.execute(cq)).scalar_one() or 0)
+    r = await db.execute(q.limit(limit).offset(offset))
+    rows = list(r.scalars().all())
+    id_set = {int(x.user_id) for x in rows if x.user_id is not None}
+    name_by_id = await _username_map_for_user_ids(db, id_set)
+    items = [
+        OperationLogEntryOut(
+            id=row.id,
+            created_at=row.created_at,
+            username=name_by_id.get(int(row.user_id)) if row.user_id is not None else None,
+            is_admin_action=bool(row.is_admin_action),
+            method=row.method,
+            path=row.path,
+            business_summary=getattr(row, "business_summary", None) or "",
+            params_json=row.params_json or "{}",
+            success=bool(row.success),
+            failure_reason=row.failure_reason,
+        )
+        for row in rows
+    ]
+    return OperationLogListOut(items=items, total=total)

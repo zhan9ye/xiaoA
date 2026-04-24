@@ -43,6 +43,7 @@ def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
         sell_start_time=(getattr(row, "sell_start_time", None) or "") or "",
         sold_son_ids_json=(getattr(row, "sold_son_ids_json", None) or "") or "{}",
         listing_amounts_json=(getattr(row, "listing_amounts_json", None) or "") or "{}",
+        main_account_info_json=(getattr(row, "main_account_info_json", None) or "") or "{}",
         sell_sort_field=ssf,
         sell_sort_desc=ssd,
     )
@@ -137,6 +138,7 @@ async def persist_trading_config(
             sell_start_time=cfg.sell_start_time or "",
             sold_son_ids_json=cfg.sold_son_ids_json or "{}",
             listing_amounts_json=cfg.listing_amounts_json or "{}",
+            main_account_info_json=cfg.main_account_info_json or "{}",
             sell_sort_field=ssf,
             sell_sort_desc=bool(cfg.sell_sort_desc),
         )
@@ -157,6 +159,7 @@ async def persist_trading_config(
         row.sell_start_time = cfg.sell_start_time or ""
         row.sold_son_ids_json = cfg.sold_son_ids_json or "{}"
         row.listing_amounts_json = cfg.listing_amounts_json or "{}"
+        row.main_account_info_json = cfg.main_account_info_json or "{}"
         row.sell_sort_field = ssf
         row.sell_sort_desc = bool(cfg.sell_sort_desc)
     await session.commit()

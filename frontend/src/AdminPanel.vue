@@ -666,6 +666,10 @@ function backToConsole() {
   window.location.hash = "";
 }
 
+function goOperationLogs() {
+  window.location.hash = "#/admin/operation-logs";
+}
+
 onMounted(() => {
   if (token.value) refreshAll();
 });
@@ -677,6 +681,14 @@ onMounted(() => {
       <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
         <h1 class="text-xl font-semibold text-rose-300/90">后台管理</h1>
         <div class="flex flex-wrap gap-2">
+          <button
+            v-if="token"
+            type="button"
+            class="rounded-lg border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-900/50"
+            @click="goOperationLogs"
+          >
+            用户操作日志
+          </button>
           <button
             type="button"
             class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
