@@ -9,7 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth_crypto import hash_password, verify_password
-from app.auth_jwt import create_admin_access_token
+from app.auth_jwt import create_access_token, create_admin_access_token
 from app.db import get_db
 from app.deps_admin import is_admin_auth_configured, require_admin
 from app.models import AdminEcsInstanceLock, ProxyPoolEntry, User, UserOperationLog
@@ -35,11 +35,15 @@ from app.schemas import (
     AdminSetDisabledIn,
     AdminSetPasswordIn,
     AdminSetPointsIn,
+    AdminSetUserRemarkIn,
+    AdminImpersonateIn,
+    AdminImpersonatePolicyOut,
     AdminTokenOut,
     AdminUserListOut,
     AdminUserProxyIn,
     AdminUserRow,
     AdminOperationLogsClearOut,
+    TokenOut,
     OperationLogEntryOut,
     OperationLogListOut,
     UserPublic,
@@ -159,6 +163,15 @@ async def admin_login(body: AdminLoginIn) -> AdminTokenOut:
     if not u_ok or not _verify_admin_password(body.password):
         raise HTTPException(status_code=401, detail="账号或密码错误")
     return AdminTokenOut(access_token=create_admin_access_token())
+
+
+@router.get("/impersonate-policy", response_model=AdminImpersonatePolicyOut)
+async def admin_impersonate_policy(_auth: None = Depends(require_admin)) -> AdminImpersonatePolicyOut:
+    """返回「代为进入」功能开关与是否须二次密码（仅供已登录管理端调用）。"""
+    return AdminImpersonatePolicyOut(
+        enabled=bool(settings.admin_impersonate_enabled),
+        require_password=bool(settings.admin_impersonate_require_password),
+    )
 
 
 @router.get("/proxy-pool", response_model=AdminProxyPoolListOut)
@@ -526,12 +539,59 @@ async def admin_list_users(
                 is_disabled=bool(u.is_disabled),
                 points_balance=int(u.points_balance or 0),
                 subscription_end_at=u.subscription_end_at,
+                admin_remark=u.admin_remark or "",
                 proxy_entry_id=p.id if p else None,
                 proxy_label=(p.label or "") if p else None,
                 proxy_host_preview=_proxy_host_preview(p.proxy_url) if p else None,
             )
         )
     return AdminUserListOut(users=users_out)
+
+
+@router.post("/users/{user_id}/impersonate", response_model=TokenOut)
+async def admin_impersonate_user(
+    user_id: int,
+    body: AdminImpersonateIn,
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> TokenOut:
+    """
+    签发与用户登录相同的 JWT，仅管理端可调用（Depends(require_admin) + 可选二次密码）。
+    公开 API 中不存在等价接口；平台用户令牌无法通过 typ 校验，不能调用本路由。
+    """
+    if not bool(settings.admin_impersonate_enabled):
+        raise HTTPException(
+            status_code=403,
+            detail="服务端已关闭「代为进入用户前端」（ADMIN_IMPERSONATE_ENABLED=false）",
+        )
+    if bool(settings.admin_impersonate_require_password):
+        ap = (body.admin_password or "").strip()
+        if not ap or not _verify_admin_password(ap):
+            raise HTTPException(
+                status_code=403,
+                detail="代为进入须再次验证管理员登录密码（ADMIN_IMPERSONATE_REQUIRE_PASSWORD）",
+            )
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if bool(getattr(user, "is_disabled", False)):
+        raise HTTPException(status_code=403, detail="该账号已禁用，无法代为进入")
+    return TokenOut(access_token=create_access_token(user_id, admin_impersonation=True))
+
+
+@router.patch("/users/{user_id}/remark")
+async def admin_set_user_remark(
+    user_id: int,
+    body: AdminSetUserRemarkIn,
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.admin_remark = (body.admin_remark or "").strip()[:8000]
+    await db.commit()
+    return {"ok": True, "user_id": user_id}
 
 
 @router.post("/users", response_model=UserPublic)

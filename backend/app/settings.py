@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     admin_password: str = ""
     admin_password_hash: str = ""
     admin_jwt_expire_hours: int = 8
+    # 仅影响 POST /api/admin/users/{id}/impersonate；关闭后接口直接拒绝（仍须管理员 JWT）
+    admin_impersonate_enabled: bool = True
+    # True：代为进入须随请求再次提交管理员登录密码（与用户密码无关）；可在 .env 设 ADMIN_IMPERSONATE_REQUIRE_PASSWORD=false 关闭
+    admin_impersonate_require_password: bool = True
     registration_open: bool = True
     # 同一 IP 登录失败达到此次数后，须先通过算术验证码再验密码（内存计数，多 worker 各算各的）
     login_captcha_after_failures: int = 3

@@ -4,6 +4,7 @@ import AdminOperationLogsPanel from "./AdminOperationLogsPanel.vue";
 import AdminPanel from "./AdminPanel.vue";
 import ContactPage from "./ContactPage.vue";
 import ConsolePanel from "./ConsolePanel.vue";
+import ImpersonateBridge from "./ImpersonateBridge.vue";
 import LoginScreen from "./LoginScreen.vue";
 
 const LS_TOKEN = "access_token";
@@ -28,17 +29,27 @@ function contactHash() {
   return h === "#/contact" || h === "#contact";
 }
 
+function impersonateBridgeHash() {
+  if (typeof window === "undefined") return false;
+  const h = window.location.hash || "";
+  return /^#\/impersonate\/[A-Za-z0-9_-]+$/.test(h);
+}
+
 const isAdminView = ref(adminHash());
 const isAdminOperationLogsView = ref(adminOperationLogsHash());
 const isContactView = ref(contactHash());
+
+const isImpersonateBridge = ref(impersonateBridgeHash());
 
 function onHashChange() {
   isAdminView.value = adminHash();
   isAdminOperationLogsView.value = adminOperationLogsHash();
   isContactView.value = contactHash();
+  isImpersonateBridge.value = impersonateBridgeHash();
 }
 
 onMounted(() => {
+  isImpersonateBridge.value = impersonateBridgeHash();
   window.addEventListener("hashchange", onHashChange);
 });
 
@@ -58,7 +69,8 @@ function logout() {
 </script>
 
 <template>
-  <AdminOperationLogsPanel v-if="isAdminView && isAdminOperationLogsView" />
+  <ImpersonateBridge v-if="isImpersonateBridge" />
+  <AdminOperationLogsPanel v-else-if="isAdminView && isAdminOperationLogsView" />
   <AdminPanel v-else-if="isAdminView" />
   <template v-else-if="token">
     <ContactPage v-if="isContactView" :logged-in="true" />

@@ -19,6 +19,10 @@ def is_admin_auth_configured() -> bool:
 async def require_admin(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> None:
+    """
+    仅接受管理员 JWT（payload.typ == admin）。平台用户登录令牌无 typ、sub 为数字用户 id，
+    会在 typ 校验处被拒绝，因此所有 Depends(require_admin) 的接口不可能被普通用户 Bearer 调用。
+    """
     if not is_admin_auth_configured():
         raise HTTPException(
             status_code=503,

@@ -7,10 +7,12 @@ from app.settings import settings
 ADMIN_TOKEN_TYP = "admin"
 
 
-def create_access_token(user_id: int) -> str:
+def create_access_token(user_id: int, *, admin_impersonation: bool = False) -> str:
     now = datetime.now(timezone.utc)
     exp = now + timedelta(hours=settings.jwt_expire_hours)
     payload = {"sub": str(user_id), "exp": exp, "iat": now}
+    if admin_impersonation:
+        payload["adm_imp"] = True
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 

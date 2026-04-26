@@ -40,6 +40,8 @@ class User(Base):
     points_balance: Mapped[int] = mapped_column(Integer, default=0)
     # None = 未开通（须积分兑换）；非空且已过期则须续兑
     subscription_end_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime(), nullable=True)
+    # 管理端对该平台用户的备注（不入业务逻辑，仅展示）
+    admin_remark: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
 
 class AdminEcsInstanceLock(Base):

@@ -504,6 +504,7 @@ class AdminUserRow(BaseModel):
     is_disabled: bool
     points_balance: int
     subscription_end_at: Optional[datetime] = None
+    admin_remark: str = ""
     # 出站代理池绑定（proxy_pool_entries）
     proxy_entry_id: Optional[int] = None
     proxy_label: Optional[str] = None
@@ -531,6 +532,25 @@ class AdminSetPointsIn(BaseModel):
 
 class AdminSetDisabledIn(BaseModel):
     disabled: bool
+
+
+class AdminSetUserRemarkIn(BaseModel):
+    """管理端用户备注（纯文本，仅后台展示）。"""
+
+    admin_remark: str = Field(default="", max_length=8000)
+
+
+class AdminImpersonatePolicyOut(BaseModel):
+    """代为进入用户前端：服务端策略（须已携带管理员 JWT 才能读取）。"""
+
+    enabled: bool
+    require_password: bool
+
+
+class AdminImpersonateIn(BaseModel):
+    """代为进入：若服务端要求二次验证，须填写管理员登录密码（非平台用户密码）。"""
+
+    admin_password: Optional[str] = Field(default=None, max_length=256)
 
 
 class AdminProxyPoolAddIn(BaseModel):

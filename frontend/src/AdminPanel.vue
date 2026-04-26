@@ -26,6 +26,11 @@ const pwdModal = ref({ open: false, userId: null, username: "", value: "" });
 const ptsModal = ref({ open: false, userId: null, username: "", value: "" });
 const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "" });
 const poolEditModal = ref({ open: false, id: null, label: "", proxy_url: "" });
+const remarkModal = ref({ open: false, userId: null, username: "", value: "" });
+const impersonateBusyId = ref(null);
+/** 与 GET /api/admin/impersonate-policy 对齐；加载前按最严默认避免误放行 */
+const impersonatePolicy = ref({ enabled: true, require_password: true });
+const impersonatePwdModal = ref({ open: false, row: null, password: "" });
 
 /** 阿里云 ECS：按启动模板创建（测试） */
 const ecsTestAmount = ref(1);
@@ -85,10 +90,31 @@ function adminLogout() {
   users.value = [];
   proxyEntries.value = [];
   actionMsg.value = "";
+  impersonatePolicy.value = { enabled: true, require_password: true };
+}
+
+async function loadImpersonatePolicy() {
+  if (!token.value) return;
+  try {
+    const r = await fetch("/api/admin/impersonate-policy", { headers: headers() });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) return;
+    const j = await r.json();
+    impersonatePolicy.value = {
+      enabled: Boolean(j.enabled),
+      require_password: Boolean(j.require_password),
+    };
+  } catch {
+    /* 保持默认策略 */
+  }
 }
 
 async function refreshAll() {
-  await Promise.all([loadUsers(), loadProxyPool(), loadEcsList()]);
+  await Promise.all([loadImpersonatePolicy(), loadUsers(), loadProxyPool(), loadEcsList()]);
 }
 
 async function loadEcsList() {
@@ -645,6 +671,110 @@ async function submitPts() {
   await loadUsers();
 }
 
+function remarkPreview(text) {
+  const s = (text || "").trim();
+  if (!s) return "—";
+  return s.length > 24 ? `${s.slice(0, 24)}…` : s;
+}
+
+function openRemark(row) {
+  remarkModal.value = {
+    open: true,
+    userId: row.id,
+    username: row.username,
+    value: row.admin_remark || "",
+  };
+}
+
+async function submitRemark() {
+  actionMsg.value = "";
+  const uid = remarkModal.value.userId;
+  const r = await fetch(`/api/admin/users/${uid}/remark`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({ admin_remark: remarkModal.value.value }),
+  });
+  if (r.status === 401) {
+    adminLogout();
+    return;
+  }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    actionMsg.value = typeof j.detail === "string" ? j.detail : "保存备注失败";
+    return;
+  }
+  remarkModal.value.open = false;
+  actionMsg.value = `已更新用户 #${uid} 备注`;
+  await loadUsers();
+}
+
+async function runImpersonate(row, adminPassword) {
+  actionMsg.value = "";
+  impersonateBusyId.value = row.id;
+  try {
+    const payload = {};
+    if (adminPassword) payload.admin_password = adminPassword;
+    const r = await fetch(`/api/admin/users/${row.id}/impersonate`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(payload),
+    });
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "获取用户令牌失败";
+      return;
+    }
+    const accessToken = j.access_token;
+    if (!accessToken) {
+      actionMsg.value = "未返回令牌";
+      return;
+    }
+    const key = `imp_${row.id}_${Date.now()}_${Math.random().toString(36).slice(2, 14)}`;
+    localStorage.setItem(key, accessToken);
+    window.open(`${window.location.origin}${window.location.pathname}#/impersonate/${key}`, "_blank");
+    setTimeout(() => {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        /* ignore */
+      }
+    }, 120000);
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    impersonateBusyId.value = null;
+  }
+}
+
+function enterUserFrontend(row) {
+  if (row.is_disabled) return;
+  if (!impersonatePolicy.value.enabled) {
+    actionMsg.value = "「代为进入用户前端」已在服务端关闭（ADMIN_IMPERSONATE_ENABLED）";
+    return;
+  }
+  if (impersonatePolicy.value.require_password) {
+    impersonatePwdModal.value = { open: true, row, password: "" };
+    return;
+  }
+  runImpersonate(row, "");
+}
+
+async function submitImpersonatePassword() {
+  const row = impersonatePwdModal.value.row;
+  if (!row) return;
+  const pwd = impersonatePwdModal.value.password;
+  if (!pwd) {
+    actionMsg.value = "请输入管理员登录密码";
+    return;
+  }
+  impersonatePwdModal.value = { open: false, row: null, password: "" };
+  await runImpersonate(row, pwd);
+}
+
 async function deleteUser(row) {
   if (!window.confirm(`确定删除用户「${row.username}」（id=${row.id}）？不可恢复。`)) return;
   actionMsg.value = "";
@@ -708,7 +838,6 @@ onMounted(() => {
       </div>
 
       <div v-if="!token" class="mx-auto max-w-md rounded-2xl border border-rose-500/25 bg-zinc-900/60 p-6">
-        <p class="mb-4 text-xs text-zinc-500">使用 .env 中配置的 admin_username / admin_password 登录（与平台用户无关）。</p>
         <label class="mb-1 block text-xs text-zinc-400">管理员账号</label>
         <input
           v-model="username"
@@ -1014,6 +1143,12 @@ onMounted(() => {
         <h2 class="mb-2 text-sm font-medium text-zinc-300">平台用户</h2>
         <p class="mb-3 text-xs text-zinc-500">
           创建账号不受前台「注册开关」限制；试用时长与 <code class="text-zinc-400">NEW_USER_TRIAL_DAYS</code> 一致（为 0 则订阅为未开通）。
+          「代为进入用户前端」仅走 <code class="text-zinc-400">/api/admin</code> 且须管理员 JWT；服务端可设
+          <code class="text-zinc-400">ADMIN_IMPERSONATE_ENABLED=false</code> 关闭，或
+          <code class="text-zinc-400">ADMIN_IMPERSONATE_REQUIRE_PASSWORD=false</code> 关闭每次二次输入管理员密码（默认开启二次验证）。
+        </p>
+        <p v-if="token && !impersonatePolicy.enabled" class="mb-3 text-xs text-amber-400/90">
+          当前环境已关闭「代为进入用户前端」，按钮不可用。
         </p>
         <div class="mb-4 flex flex-wrap items-end gap-2 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
           <div class="min-w-[140px] flex-1 sm:max-w-xs">
@@ -1047,11 +1182,12 @@ onMounted(() => {
           </button>
         </div>
         <div class="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/40">
-          <table class="w-full min-w-[880px] border-collapse text-left text-xs">
+          <table class="w-full min-w-[1040px] border-collapse text-left text-xs">
             <thead>
               <tr class="border-b border-zinc-800 text-zinc-500">
                 <th class="px-3 py-2 font-medium">ID</th>
                 <th class="px-3 py-2 font-medium">用户名</th>
+                <th class="px-3 py-2 font-medium">管理备注</th>
                 <th class="px-3 py-2 font-medium">状态</th>
                 <th class="px-3 py-2 font-medium">积分</th>
                 <th class="px-3 py-2 font-medium">订阅至</th>
@@ -1063,6 +1199,12 @@ onMounted(() => {
               <tr v-for="u in users" :key="u.id" class="border-b border-zinc-800/80 hover:bg-white/[0.02]">
                 <td class="px-3 py-2 font-mono text-zinc-400">{{ u.id }}</td>
                 <td class="px-3 py-2">{{ u.username }}</td>
+                <td
+                  class="max-w-[140px] cursor-default px-3 py-2 text-zinc-500"
+                  :title="(u.admin_remark || '').trim() || '无备注'"
+                >
+                  {{ remarkPreview(u.admin_remark) }}
+                </td>
                 <td class="px-3 py-2">
                   <span :class="u.is_disabled ? 'text-amber-400' : 'text-emerald-500/90'">
                     {{ u.is_disabled ? "已禁用" : "正常" }}
@@ -1079,6 +1221,28 @@ onMounted(() => {
                 </td>
                 <td class="px-3 py-2">
                   <div class="flex flex-wrap gap-1">
+                    <button
+                      type="button"
+                      class="rounded border border-violet-900/50 px-1.5 py-0.5 text-violet-300/90 hover:bg-violet-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                      :disabled="u.is_disabled || !impersonatePolicy.enabled || impersonateBusyId === u.id"
+                      :title="
+                        u.is_disabled
+                          ? '已禁用账号无法进入'
+                          : !impersonatePolicy.enabled
+                            ? '服务端已关闭代为进入'
+                            : '在新标签页打开该用户的控制台（须管理员权限；可能要求再次输入管理员密码）'
+                      "
+                      @click="enterUserFrontend(u)"
+                    >
+                      {{ impersonateBusyId === u.id ? "…" : "进入前端" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded border border-zinc-600 px-1.5 py-0.5 hover:bg-zinc-800"
+                      @click="openRemark(u)"
+                    >
+                      备注
+                    </button>
                     <button
                       type="button"
                       class="rounded border border-cyan-900/50 px-1.5 py-0.5 text-cyan-400/90 hover:bg-cyan-950/30"
@@ -1190,6 +1354,70 @@ onMounted(() => {
             取消
           </button>
           <button type="button" class="rounded bg-rose-700 px-3 py-1.5 text-xs text-white hover:bg-rose-600" @click="submitPoolEdit">
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="impersonatePwdModal.open && impersonatePwdModal.row"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
+      @click.self="impersonatePwdModal = { open: false, row: null, password: '' }"
+    >
+      <div class="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
+        <h3 class="mb-2 text-sm font-medium text-zinc-200">
+          验证管理员密码 · {{ impersonatePwdModal.row.username }} (#{{ impersonatePwdModal.row.id }})
+        </h3>
+        <p class="mb-2 text-xs text-zinc-500">
+          请输入 <strong class="text-zinc-400">.env 中管理员账号</strong> 的登录密码（不是该用户的密码）。令牌仅通过管理接口签发。
+        </p>
+        <input
+          v-model="impersonatePwdModal.password"
+          type="password"
+          autocomplete="current-password"
+          class="mb-3 w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm outline-none ring-violet-500/40 focus:ring-2"
+          placeholder="管理员密码"
+          @keyup.enter="submitImpersonatePassword"
+        />
+        <div class="flex justify-end gap-2">
+          <button
+            type="button"
+            class="rounded px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
+            @click="impersonatePwdModal = { open: false, row: null, password: '' }"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="rounded bg-violet-700 px-3 py-1.5 text-xs text-white hover:bg-violet-600"
+            @click="submitImpersonatePassword"
+          >
+            确认并打开
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="remarkModal.open"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
+      @click.self="remarkModal.open = false"
+    >
+      <div class="w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
+        <h3 class="mb-2 text-sm font-medium text-zinc-200">管理备注 · {{ remarkModal.username }} (#{{ remarkModal.userId }})</h3>
+        <p class="mb-2 text-xs text-zinc-500">仅管理端可见，用于记录客户情况、工单说明等。</p>
+        <textarea
+          v-model="remarkModal.value"
+          rows="6"
+          class="mb-3 w-full resize-y rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm text-zinc-200 outline-none ring-rose-500/40 focus:ring-2"
+          placeholder="可留空"
+        />
+        <div class="flex justify-end gap-2">
+          <button type="button" class="rounded px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800" @click="remarkModal.open = false">
+            取消
+          </button>
+          <button type="button" class="rounded bg-rose-700 px-3 py-1.5 text-xs text-white hover:bg-rose-600" @click="submitRemark">
             保存
           </button>
         </div>

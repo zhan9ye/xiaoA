@@ -139,6 +139,10 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN active_trading_slot INTEGER NOT NULL DEFAULT 0"
                 )
+            if "admin_remark" not in ucols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN admin_remark TEXT NOT NULL DEFAULT ''"
+                )
 
             try:
                 op_rows = (await conn.exec_driver_sql("PRAGMA table_info(user_operation_logs)")).fetchall()
