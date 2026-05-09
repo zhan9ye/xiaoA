@@ -37,6 +37,7 @@ from app.schemas import (
     SubaccountsOut,
     CreditPackageOut,
     CreditsOverviewOut,
+    GoogleTotpPreviewOut,
     RedeemDaysIn,
     RedeemDaysOut,
     RedeemPreviewOut,
@@ -373,6 +374,28 @@ async def change_password(
     user.password_hash = hash_password(body.new_password)
     await db.commit()
     return {"ok": True}
+
+
+@app.get("/api/auth/google-totp-preview", response_model=GoogleTotpPreviewOut)
+async def google_totp_preview(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    返回当前配置 key_token 生成的 Google 动态码（仅用于用户手动对比手机验证码）。
+    """
+    st = await get_or_create_state(user.id)
+    if not await ensure_trading_config_loaded(db, user.id, st) or st.config is None:
+        raise HTTPException(status_code=400, detail="请先保存交易配置")
+    code, err = totp_now_from_secret_ex(st.config.key_token)
+    if not code:
+        raise HTTPException(status_code=400, detail=err or "无法生成验证码，请检查 key_token")
+    now_utc = datetime.now(timezone.utc)
+    sec = int(now_utc.timestamp())
+    remain = 30 - (sec % 30)
+    if remain <= 0:
+        remain = 30
+    return GoogleTotpPreviewOut(code=code, seconds_remaining=remain, generated_at=now_utc)
 
 
 @app.get("/api/credits/overview", response_model=CreditsOverviewOut)

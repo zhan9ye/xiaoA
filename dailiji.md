@@ -1,5 +1,7 @@
 1. 登录代理机
 在 阿里云控制台 里：
+查看公网IP
+curl -4 -s ifconfig.me; echo
 
 看实例是否已设 登录密码 或绑定 密钥对；
 用 Workbench 远程连接 或你本机：
@@ -41,6 +43,9 @@ via off
 sudo squid -k parse
 sudo systemctl restart squid
 sudo systemctl status squid
+
+sudo squid -k parse && sudo systemctl reload squid
+# 或旧系统：service squid reload
 4. 本机防火墙（若开了 ufw）
 sudo ufw allow from 172.19.205.90 to any port 3128 proto tcp
 sudo ufw reload
@@ -50,18 +55,18 @@ sudo ufw reload
 无认证时代理池里填：
 
 http://172.19.205.89:3128
-（172.19.205.89 换成代理机私网 IP。）
+# （172.19.205.89 换成代理机私网 IP。）
 
 在主服务器执行：
 
-curl -x http://172.19.205.89:3128 -k -I --connect-timeout 10 https://www.akapi1.com/
-能出现 HTTP 响应头（例如 403）即表示 代理 + CONNECT 正常。
+curl -x http://47.237.207.104:3128 -k -I --connect-timeout 10 https://www.akapi1.com/
+# 能出现 HTTP 响应头（例如 403）即表示 代理 + CONNECT 正常。
 
 sudo tail -f /var/log/squid/access.log 
-查看日志看是否走代理了
+# 查看日志看是否走代理了
 
-6.（可选）再加「用户名密码」
-在代理机上：
+# 6.（可选）再加「用户名密码」
+# 在代理机上：
 
 sudo htpasswd -c /etc/squid/passwd 你的用户名
 # 按提示设密码

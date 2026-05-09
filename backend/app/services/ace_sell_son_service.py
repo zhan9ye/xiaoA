@@ -1,8 +1,10 @@
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import httpx
 
+from app.middleware_request_log import log_httpx_outbound_request_error_sync
 from app.services.rpc_common import get_rpc_browser_headers
 from app.services.selling_eligibility import ace_sell_rpc_son_id
 from app.services.session_manager import SessionManager
@@ -81,6 +83,21 @@ async def post_ace_sell_son(
             data=data,
         )
     except httpx.RequestError as e:
+        if not sm.uses_multi_proxy_dispatch():
+            try:
+                req_body = urlencode(data, doseq=True)
+            except Exception:
+                req_body = str(data)
+            log_httpx_outbound_request_error_sync(
+                method="POST",
+                url=target_url,
+                req_body=req_body,
+                err=(str(e) or repr(e)),
+                platform_user_id=sm.platform_user_id,
+                proxy_label=sm.outbound_proxy_log_label(),
+                uses_outbound_proxy=sm.uses_outbound_proxy(),
+                proxy_debug=None,
+            )
         return False, 0, None, str(e)
 
     text = ""

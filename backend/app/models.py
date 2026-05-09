@@ -55,7 +55,7 @@ class AdminEcsInstanceLock(Base):
 class ProxyPoolEntry(Base):
     """
     出站 HTTP(S) 代理池（如自建 ECS Squid）。assigned_user_id 为空表示空闲；
-    用户首次需要出站 RPC 时从池中领取一条并静态绑定，直至用户删除（FK SET NULL 回收）。
+    用户可绑定多条（测试：多出口轮换）；首次需要出站 RPC 时若尚无绑定则从池领取一条。
     """
 
     __tablename__ = "proxy_pool_entries"
@@ -67,7 +67,7 @@ class ProxyPoolEntry(Base):
     assigned_user_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
-        unique=True,
+        index=True,
     )
 
 

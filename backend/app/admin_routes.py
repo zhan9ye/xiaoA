@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
@@ -38,6 +39,8 @@ from app.schemas import (
     AdminSetUserRemarkIn,
     AdminImpersonateIn,
     AdminImpersonatePolicyOut,
+    AdminMultiProxyPolicyOut,
+    AdminProxyBindingBrief,
     AdminTokenOut,
     AdminUserListOut,
     AdminUserProxyIn,
@@ -172,6 +175,12 @@ async def admin_impersonate_policy(_auth: None = Depends(require_admin)) -> Admi
         enabled=bool(settings.admin_impersonate_enabled),
         require_password=bool(settings.admin_impersonate_require_password),
     )
+
+
+@router.get("/multi-proxy-policy", response_model=AdminMultiProxyPolicyOut)
+async def admin_multi_proxy_policy(_auth: None = Depends(require_admin)) -> AdminMultiProxyPolicyOut:
+    """是否允许多条代理追加绑定（与 .env MULTI_PROXY_PER_USER_ENABLED 一致）。"""
+    return AdminMultiProxyPolicyOut(multi_proxy_per_user_enabled=bool(settings.multi_proxy_per_user_enabled))
 
 
 @router.get("/proxy-pool", response_model=AdminProxyPoolListOut)
@@ -477,6 +486,33 @@ async def admin_set_user_proxy(
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
 
+    if body.pool_entry_id is not None and not body.exclusive:
+        if not bool(settings.multi_proxy_per_user_enabled):
+            raise HTTPException(
+                status_code=400,
+                detail="多代理追加绑定未开启（MULTI_PROXY_PER_USER_ENABLED=false）",
+            )
+        entry = await db.get(ProxyPoolEntry, body.pool_entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="池条目不存在")
+        if not entry.is_active:
+            raise HTTPException(status_code=400, detail="该代理条目已停用，请先在池中启用")
+        if entry.assigned_user_id is not None and entry.assigned_user_id != user_id:
+            raise HTTPException(status_code=400, detail="该代理已被其他用户占用")
+        st = await get_or_create_state(user_id)
+        await ensure_trading_config_loaded(db, user_id, st)
+        should_restart = should_restart_runner_like_frontend_after_proxy_rebind(st)
+        if should_restart:
+            await runner_execute_stop(db, user_id)
+        entry.assigned_user_id = user_id
+        await db.commit()
+        await invalidate_user_outbound_session(user_id)
+        if should_restart:
+            st2 = await get_or_create_state(user_id)
+            await ensure_trading_config_loaded(db, user_id, st2)
+            await runner_execute_start_core(db, user_id, st2)
+        return {"ok": True, "pool_entry_id": entry.id, "exclusive": False}
+
     if body.pool_entry_id is None:
         st = await get_or_create_state(user_id)
         await ensure_trading_config_loaded(db, user_id, st)
@@ -528,10 +564,29 @@ async def admin_list_users(
 ) -> AdminUserListOut:
     result = await db.execute(select(User).order_by(User.id.asc()))
     rows: List[User] = list(result.scalars().all())
+    uids = [int(u.id) for u in rows]
+    by_uid: dict[int, List[ProxyPoolEntry]] = defaultdict(list)
+    if uids:
+        pr = await db.execute(
+            select(ProxyPoolEntry)
+            .where(ProxyPoolEntry.assigned_user_id.in_(uids))
+            .order_by(ProxyPoolEntry.id.asc())
+        )
+        for e in pr.scalars():
+            if e.assigned_user_id is not None:
+                by_uid[int(e.assigned_user_id)].append(e)
     users_out: List[AdminUserRow] = []
     for u in rows:
-        pr = await db.execute(select(ProxyPoolEntry).where(ProxyPoolEntry.assigned_user_id == u.id).limit(1))
-        p = pr.scalar_one_or_none()
+        plist = by_uid.get(int(u.id), [])
+        briefs = [
+            AdminProxyBindingBrief(
+                id=int(e.id),
+                proxy_host_preview=_proxy_host_preview(e.proxy_url),
+                proxy_label=(e.label or "") or None,
+            )
+            for e in plist
+        ]
+        p = plist[0] if plist else None
         users_out.append(
             AdminUserRow(
                 id=u.id,
@@ -540,6 +595,7 @@ async def admin_list_users(
                 points_balance=int(u.points_balance or 0),
                 subscription_end_at=u.subscription_end_at,
                 admin_remark=u.admin_remark or "",
+                proxy_bindings=briefs,
                 proxy_entry_id=p.id if p else None,
                 proxy_label=(p.label or "") if p else None,
                 proxy_host_preview=_proxy_host_preview(p.proxy_url) if p else None,

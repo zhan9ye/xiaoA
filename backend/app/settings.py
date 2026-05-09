@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # 代理池（表 proxy_pool_entries）非空时：用户首次出站 RPC 领取一条并固定绑定。
     # True：池已满无法分配时拒绝（503）；False：回退为不使用代理直连。
     proxy_pool_require_available: bool = True  # PROXY_POOL_REQUIRE_AVAILABLE
+    # True（默认）：用户未在管理端绑定任何代理时，仍可从池中自动领取一条；False：仅使用显式绑定，否则直连（适合「全员不用池」）
+    proxy_pool_auto_assign: bool = True  # PROXY_POOL_AUTO_ASSIGN
+    # True：管理端可追加绑定多条代理，出站 RPC 每请求轮询出口（共享 Cookie）；False：仅单条独占绑定
+    multi_proxy_per_user_enabled: bool = True
 
     # 出站 httpx 是否校验 HTTPS 证书链（连接 akapi1 等 RPC）。默认 True。
     # 若对端证书链不完整导致 [SSL: CERTIFICATE_VERIFY_FAILED]，可先设 false 权宜（存在中间人风险）。

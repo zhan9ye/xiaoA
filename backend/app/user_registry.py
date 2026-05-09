@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.services.log_hub import LogHub
 from app.services.session_manager import SessionManager, normalize_proxy_url
@@ -9,6 +9,12 @@ _states: Dict[int, AppState] = {}
 _managers: Dict[int, SessionManager] = {}
 _hubs: Dict[int, LogHub] = {}
 _lock = asyncio.Lock()
+
+
+def _session_manager_proxy_key(sm: SessionManager) -> Tuple[tuple, tuple]:
+    urls = tuple(getattr(sm, "_proxy_urls", ()) or ())
+    labs = tuple(getattr(sm, "_proxy_labels", ()) or ())
+    return urls, labs
 
 
 async def get_or_create_state(user_id: int) -> AppState:
@@ -25,32 +31,40 @@ async def get_or_create_log_hub(user_id: int) -> LogHub:
         return _hubs[user_id]
 
 
-def _normalize_proxy_label(proxy_label: Optional[str]) -> Optional[str]:
-    t = (proxy_label or "").strip()
-    return t or None
-
-
 async def get_or_create_session_manager(
     user_id: int,
-    proxy_url: Optional[str] = None,
     *,
-    proxy_label: Optional[str] = None,
+    proxy_urls: Optional[List[str]] = None,
+    proxy_labels: Optional[List[Optional[str]]] = None,
 ) -> SessionManager:
-    """proxy_url / proxy_label 与内存中已存在实例不一致时会关闭旧 client 并重建（例如首次领到池内代理）。"""
-    desired = normalize_proxy_url(proxy_url)
-    desired_label = _normalize_proxy_label(proxy_label)
+    """
+    proxy_urls / proxy_labels 与内存中已存在实例不一致时会关闭旧 client 并重建
+    （例如管理端增删绑定、首次领到池内代理）。
+    """
+    raw_u = list(proxy_urls or [])
+    labs_in = list(proxy_labels or [])
+    nu: List[str] = []
+    nl: List[Optional[str]] = []
+    for i, u in enumerate(raw_u):
+        x = normalize_proxy_url(u)
+        if not x:
+            continue
+        nu.append(x)
+        lab = labs_in[i] if i < len(labs_in) else None
+        nl.append((lab or "").strip() or None)
+    while len(nl) < len(nu):
+        nl.append(None)
+    desired_key = (tuple(nu), tuple(nl))
     async with _lock:
         cur = _managers.get(user_id)
         if cur is not None:
-            prev = getattr(cur, "_proxy_url", None)
-            prev_label = getattr(cur, "_proxy_label", None)
-            if prev == desired and prev_label == desired_label:
+            if _session_manager_proxy_key(cur) == desired_key:
                 return cur
             await cur.close()
         _managers[user_id] = SessionManager(
-            proxy_url=desired,
             platform_user_id=user_id,
-            proxy_label=desired_label,
+            proxy_urls=nu,
+            proxy_labels=nl,
         )
         return _managers[user_id]
 

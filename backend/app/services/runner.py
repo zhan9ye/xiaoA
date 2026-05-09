@@ -634,11 +634,6 @@ async def _hot_window_sell_session(
             LogLevel.info,
             f"售卖轮次：本轮待处理 {len(remaining_rows)} 个子账号",
         )
-        await log_hub.push(
-            LogLevel.info,
-            f"HotWindow 波次：每波并发 {concurrency} 路 ACE_Sell_Son，波间隔 {wave_gap_s}s（RPC_TIMEOUT_SECONDS）",
-        )
-
         rk0 = cfg.rpc_login_key.strip()
         uid0 = cfg.rpc_user_id.strip()
         if not rk0 or not uid0:
@@ -900,9 +895,11 @@ async def _hot_window_sell_session(
             if not to_try and not active_by_son:
                 break
 
+            # 严格并发上限：新发起数 + 已在飞任务数 <= HOT_WINDOW_CONCURRENCY
+            available_slots = max(0, concurrency - len(active_by_son))
             launched = 0
             for row in to_try:
-                if launched >= concurrency:
+                if launched >= available_slots:
                     break
                 tid = ace_sell_track_id(row)
                 if not tid or tid in active_by_son:
@@ -910,7 +907,12 @@ async def _hot_window_sell_session(
                 active_by_son[tid] = asyncio.create_task(process_row(row))
                 launched += 1
 
-            await _wait_interruptible(state, wave_gap_s)
+            # launched>0：维持波间隔节奏；
+            # launched=0：说明当前无可发起槽位或暂无可发项，必须让出事件循环，避免空转占满 CPU 导致接口“卡死”。
+            if launched > 0:
+                await _wait_interruptible(state, wave_gap_s)
+            else:
+                await _wait_interruptible(state, 0.2)
 
         if channel_ev.is_set() or relogin_ev.is_set() or state.stop_event.is_set():
             pending_cancel = list(active_by_son.values())

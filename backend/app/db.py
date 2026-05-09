@@ -144,6 +144,53 @@ async def init_db() -> None:
                     "ALTER TABLE users ADD COLUMN admin_remark TEXT NOT NULL DEFAULT ''"
                 )
 
+            # 多代理：去掉 assigned_user_id 的 UNIQUE（旧库整表重建）
+            need_pp_multi = False
+            try:
+                idx_rows = (await conn.exec_driver_sql("PRAGMA index_list('proxy_pool_entries')")).fetchall()
+                for ir in idx_rows or []:
+                    if len(ir) < 3 or int(ir[2] or 0) != 1:
+                        continue
+                    iname = str(ir[1] or "")
+                    cols = (await conn.exec_driver_sql(f"PRAGMA index_info('{iname}')")).fetchall()
+                    if len(cols) == 1 and str(cols[0][2] or "").lower() == "assigned_user_id":
+                        need_pp_multi = True
+                        break
+                if not need_pp_multi:
+                    prow = (
+                        await conn.exec_driver_sql(
+                            "SELECT sql FROM sqlite_master WHERE type='table' AND name='proxy_pool_entries'"
+                        )
+                    ).fetchone()
+                    if prow and prow[0] and "assigned_user_id" in prow[0] and "UNIQUE" in prow[0].upper():
+                        need_pp_multi = True
+            except Exception:
+                need_pp_multi = False
+            if need_pp_multi:
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE proxy_pool_entries__new (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        proxy_url TEXT NOT NULL,
+                        label VARCHAR(128) NOT NULL DEFAULT '',
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        assigned_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    """
+                    INSERT INTO proxy_pool_entries__new (id, proxy_url, label, is_active, assigned_user_id)
+                    SELECT id, proxy_url, label, is_active, assigned_user_id FROM proxy_pool_entries
+                    """
+                )
+                await conn.exec_driver_sql("DROP TABLE proxy_pool_entries")
+                await conn.exec_driver_sql("ALTER TABLE proxy_pool_entries__new RENAME TO proxy_pool_entries")
+                await conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_proxy_pool_entries_assigned_user_id "
+                    "ON proxy_pool_entries(assigned_user_id)"
+                )
+
             try:
                 op_rows = (await conn.exec_driver_sql("PRAGMA table_info(user_operation_logs)")).fetchall()
             except Exception:

@@ -24,7 +24,8 @@ const createUserBusy = ref(false);
 
 const pwdModal = ref({ open: false, userId: null, username: "", value: "" });
 const ptsModal = ref({ open: false, userId: null, username: "", value: "" });
-const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "" });
+const bindModal = ref({ open: false, userId: null, username: "", poolEntryId: "", appendOnly: false });
+const multiProxyEnabled = ref(true);
 const poolEditModal = ref({ open: false, id: null, label: "", proxy_url: "" });
 const remarkModal = ref({ open: false, userId: null, username: "", value: "" });
 const impersonateBusyId = ref(null);
@@ -93,6 +94,23 @@ function adminLogout() {
   impersonatePolicy.value = { enabled: true, require_password: true };
 }
 
+async function loadMultiProxyPolicy() {
+  if (!token.value) return;
+  try {
+    const r = await fetch("/api/admin/multi-proxy-policy", { headers: headers() });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) return;
+    const j = await r.json();
+    multiProxyEnabled.value = Boolean(j.multi_proxy_per_user_enabled);
+  } catch {
+    /* 默认 true */
+  }
+}
+
 async function loadImpersonatePolicy() {
   if (!token.value) return;
   try {
@@ -114,7 +132,13 @@ async function loadImpersonatePolicy() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadImpersonatePolicy(), loadUsers(), loadProxyPool(), loadEcsList()]);
+  await Promise.all([
+    loadImpersonatePolicy(),
+    loadMultiProxyPolicy(),
+    loadUsers(),
+    loadProxyPool(),
+    loadEcsList(),
+  ]);
 }
 
 async function loadEcsList() {
@@ -545,14 +569,18 @@ function openBind(row) {
     userId: row.id,
     username: row.username,
     poolEntryId: row.proxy_entry_id != null ? String(row.proxy_entry_id) : "",
+    appendOnly: false,
   };
 }
 
 function poolOptionsForBind() {
   const uid = bindModal.value.userId;
-  return proxyEntries.value.filter(
-    (p) => p.is_active && (p.assigned_user_id == null || p.assigned_user_id === uid),
-  );
+  const append = bindModal.value.appendOnly;
+  return proxyEntries.value.filter((p) => {
+    if (!p.is_active) return false;
+    if (append) return p.assigned_user_id == null;
+    return p.assigned_user_id == null || p.assigned_user_id === uid;
+  });
 }
 
 async function submitBind() {
@@ -564,10 +592,11 @@ async function submitBind() {
     actionMsg.value = "请选择有效条目";
     return;
   }
+  const exclusive = pool_entry_id == null ? true : !bindModal.value.appendOnly;
   const r = await fetch(`/api/admin/users/${uid}/proxy`, {
     method: "PUT",
     headers: headers(),
-    body: JSON.stringify({ pool_entry_id }),
+    body: JSON.stringify({ pool_entry_id, exclusive }),
   });
   if (r.status === 401) {
     adminLogout();
@@ -578,9 +607,14 @@ async function submitBind() {
     actionMsg.value = typeof j.detail === "string" ? j.detail : "绑定失败";
     return;
   }
+  const append = bindModal.value.appendOnly && pool_entry_id != null;
   bindModal.value.open = false;
   actionMsg.value =
-    pool_entry_id == null ? `用户 #${uid} 已解除代理绑定` : `用户 #${uid} 已绑定代理池 #${pool_entry_id}`;
+    pool_entry_id == null
+      ? `用户 #${uid} 已解除全部代理绑定`
+      : append
+        ? `用户 #${uid} 已追加代理池 #${pool_entry_id}`
+        : `用户 #${uid} 已独占绑定代理池 #${pool_entry_id}（已解除该用户其它代理）`;
   await refreshAll();
 }
 
@@ -1146,6 +1180,7 @@ onMounted(() => {
           「代为进入用户前端」仅走 <code class="text-zinc-400">/api/admin</code> 且须管理员 JWT；服务端可设
           <code class="text-zinc-400">ADMIN_IMPERSONATE_ENABLED=false</code> 关闭，或
           <code class="text-zinc-400">ADMIN_IMPERSONATE_REQUIRE_PASSWORD=false</code> 关闭每次二次输入管理员密码（默认开启二次验证）。
+          多出口测试：设 <code class="text-zinc-400">MULTI_PROXY_PER_USER_ENABLED=true</code> 时可在「代理」里勾选追加绑定；出站 RPC 按请求轮询各 IP（共享 Cookie）。设 false 则恢复仅单条绑定与会话单出口。
         </p>
         <p v-if="token && !impersonatePolicy.enabled" class="mb-3 text-xs text-amber-400/90">
           当前环境已关闭「代为进入用户前端」，按钮不可用。
@@ -1182,7 +1217,7 @@ onMounted(() => {
           </button>
         </div>
         <div class="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/40">
-          <table class="w-full min-w-[1040px] border-collapse text-left text-xs">
+          <table class="w-full min-w-[1120px] border-collapse text-left text-xs">
             <thead>
               <tr class="border-b border-zinc-800 text-zinc-500">
                 <th class="px-3 py-2 font-medium">ID</th>
@@ -1212,11 +1247,18 @@ onMounted(() => {
                 </td>
                 <td class="px-3 py-2 font-mono text-zinc-300">{{ u.points_balance }}</td>
                 <td class="px-3 py-2 font-mono text-zinc-500">{{ formatEnd(u.subscription_end_at) }}</td>
-                <td class="max-w-[200px] px-3 py-2 text-zinc-400">
-                  <span v-if="u.proxy_entry_id" class="block truncate" :title="u.proxy_label || ''">
-                    <span class="font-mono text-zinc-300">{{ u.proxy_host_preview || "—" }}</span>
-                    <span v-if="u.proxy_label" class="ml-1 text-zinc-500">· {{ u.proxy_label }}</span>
-                  </span>
+                <td class="max-w-[280px] px-3 py-2 text-zinc-400">
+                  <template v-if="u.proxy_bindings && u.proxy_bindings.length">
+                    <div
+                      v-for="b in u.proxy_bindings"
+                      :key="b.id"
+                      class="truncate border-b border-zinc-800/60 py-0.5 last:border-0"
+                      :title="(b.proxy_label || '') + ''"
+                    >
+                      <span class="font-mono text-zinc-300">#{{ b.id }} {{ b.proxy_host_preview || "—" }}</span>
+                      <span v-if="b.proxy_label" class="ml-1 text-zinc-500">· {{ b.proxy_label }}</span>
+                    </div>
+                  </template>
                   <span v-else class="text-zinc-600">未绑定</span>
                 </td>
                 <td class="px-3 py-2">
@@ -1431,12 +1473,18 @@ onMounted(() => {
     >
       <div class="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
         <h3 class="mb-2 text-sm font-medium text-zinc-200">绑定出站代理 · {{ bindModal.username }} (#{{ bindModal.userId }})</h3>
-        <p class="mb-2 text-xs text-zinc-500">仅列出已启用且空闲、或已绑定到该用户的池条目。</p>
+        <p class="mb-2 text-xs text-zinc-500">
+          默认：独占绑定（会解除该用户其它代理）。勾选「追加」则只增加一条（须服务端开启多代理）。
+        </p>
+        <label v-if="multiProxyEnabled" class="mb-2 flex cursor-pointer items-center gap-2 text-xs text-zinc-400">
+          <input v-model="bindModal.appendOnly" type="checkbox" class="rounded border-zinc-600" />
+          追加绑定（保留该用户已有代理；下列表仅空闲条目）
+        </label>
         <select
           v-model="bindModal.poolEntryId"
           class="mb-3 w-full rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-sm text-zinc-200"
         >
-          <option value="">（不绑定 / 解除绑定）</option>
+          <option value="">（解除该用户全部代理绑定）</option>
           <option v-for="opt in poolOptionsForBind()" :key="opt.id" :value="String(opt.id)">
             #{{ opt.id }} · {{ opt.proxy_host_preview || "?" }}{{ opt.label ? " · " + opt.label : "" }}
           </option>

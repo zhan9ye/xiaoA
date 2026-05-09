@@ -143,6 +143,12 @@ const pwdChangeNew = ref("");
 const pwdChangeNew2 = ref("");
 const pwdChangeBusy = ref(false);
 const pwdChangeErr = ref("");
+const googleCodeModalOpen = ref(false);
+const googleCodeValue = ref("");
+const googleCodeRemain = ref(0);
+const googleCodeErr = ref("");
+const googleCodeLoading = ref(false);
+let googleCodeTimer = null;
 
 const toastMessage = ref("");
 const toastVisible = ref(false);
@@ -1261,6 +1267,47 @@ function closePwdChange() {
   pwdChangeErr.value = "";
 }
 
+async function refreshGoogleCodePreview() {
+  googleCodeLoading.value = true;
+  googleCodeErr.value = "";
+  try {
+    const r = await fetch("/api/auth/google-totp-preview", { headers: headers(), cache: "no-store" });
+    if (r.status === 401) {
+      emit("logout");
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      googleCodeErr.value = typeof j.detail === "string" ? j.detail : "获取验证码失败";
+      return;
+    }
+    googleCodeValue.value = String(j.code || "");
+    googleCodeRemain.value = Number(j.seconds_remaining || 0);
+  } catch {
+    googleCodeErr.value = "网络错误";
+  } finally {
+    googleCodeLoading.value = false;
+  }
+}
+
+async function openGoogleCodeModal() {
+  googleCodeModalOpen.value = true;
+  await refreshGoogleCodePreview();
+  if (googleCodeTimer) clearInterval(googleCodeTimer);
+  googleCodeTimer = setInterval(() => {
+    if (!googleCodeModalOpen.value) return;
+    refreshGoogleCodePreview();
+  }, 1000);
+}
+
+function closeGoogleCodeModal() {
+  googleCodeModalOpen.value = false;
+  if (googleCodeTimer) {
+    clearInterval(googleCodeTimer);
+    googleCodeTimer = null;
+  }
+}
+
 async function submitPwdChange() {
   pwdChangeErr.value = "";
   const o = pwdChangeOld.value;
@@ -1336,6 +1383,7 @@ onMounted(async () => {
     clearInterval(t);
     if (ws) ws.close();
     if (toastTimer) clearTimeout(toastTimer);
+    if (googleCodeTimer) clearInterval(googleCodeTimer);
   });
 });
 </script>
@@ -1511,6 +1559,13 @@ onMounted(async () => {
             placeholder="例如 UVT8Q7Q775XXXXXX"
             autocomplete="off"
           />
+          <button
+            type="button"
+            class="mb-2 w-full rounded-lg border border-cyan-700/70 bg-cyan-950/40 py-2 text-xs font-medium text-cyan-100 hover:bg-cyan-900/50"
+            @click="openGoogleCodeModal"
+          >
+            校验 Google 实时验证码
+          </button>
           <label class="mb-1 block text-xs text-zinc-500">助记词（12 段，每段 4 位数字）</label>
           <div class="mb-2 grid grid-cols-3 gap-2">
             <div v-for="(_p, i) in mnemonicParts" :key="i" class="flex flex-col gap-0.5">
@@ -1856,6 +1911,40 @@ onMounted(async () => {
       </main>
     </div>
   </div>
+
+  <Teleport to="body">
+    <div
+      v-if="googleCodeModalOpen"
+      class="fixed inset-0 z-[220] flex items-center justify-center bg-black/65 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="google-code-title"
+      @click.self="closeGoogleCodeModal"
+    >
+      <div class="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl ring-1 ring-black/50">
+        <h3 id="google-code-title" class="mb-2 text-sm font-semibold text-zinc-100">Google 验证码对比</h3>
+        <p class="mb-3 text-xs text-zinc-500">请与手机 Google 验证器当前 6 位验证码核对。</p>
+        <div class="mb-2 rounded-lg border border-zinc-700 bg-black/40 px-4 py-3 text-center">
+          <p class="font-mono text-3xl tracking-[0.22em] text-emerald-400">
+            {{ googleCodeValue || "------" }}
+          </p>
+          <p class="mt-2 text-xs text-zinc-500">
+            {{ googleCodeLoading ? "刷新中…" : `剩余 ${googleCodeRemain}s` }}
+          </p>
+        </div>
+        <p v-if="googleCodeErr" class="mb-3 text-xs text-amber-400/90">{{ googleCodeErr }}</p>
+        <div class="flex justify-end">
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-600 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+            @click="closeGoogleCodeModal"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
 
   <Teleport to="body">
     <div

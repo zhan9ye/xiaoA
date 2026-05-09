@@ -305,6 +305,12 @@ class RunParamsOut(BaseModel):
     sell_sort_desc: bool = False
 
 
+class GoogleTotpPreviewOut(BaseModel):
+    code: str = Field(default="", description="当前 6 位 Google 动态码")
+    seconds_remaining: int = Field(default=0, ge=0, le=30, description="当前验证码剩余秒数（0-30）")
+    generated_at: datetime = Field(description="服务端生成时间（UTC）")
+
+
 class SubaccountsOut(BaseModel):
     count: int
     items: List[Dict[str, Any]]
@@ -498,6 +504,14 @@ class AdminTokenOut(BaseModel):
     token_type: str = "bearer"
 
 
+class AdminProxyBindingBrief(BaseModel):
+    """用户绑定的单条出站代理（管理列表展示）。"""
+
+    id: int
+    proxy_host_preview: str = ""
+    proxy_label: Optional[str] = None
+
+
 class AdminUserRow(BaseModel):
     id: int
     username: str
@@ -505,7 +519,8 @@ class AdminUserRow(BaseModel):
     points_balance: int
     subscription_end_at: Optional[datetime] = None
     admin_remark: str = ""
-    # 出站代理池绑定（proxy_pool_entries）
+    # 出站代理池绑定（proxy_pool_entries）；proxy_bindings 为全部，下列三项兼容首条
+    proxy_bindings: List[AdminProxyBindingBrief] = Field(default_factory=list)
     proxy_entry_id: Optional[int] = None
     proxy_label: Optional[str] = None
     proxy_host_preview: Optional[str] = None
@@ -582,9 +597,18 @@ class AdminProxyPoolPatchIn(BaseModel):
 
 
 class AdminUserProxyIn(BaseModel):
-    """pool_entry_id 为 null 表示解除该用户绑定；否则绑定到指定池条目（须空闲或已属于该用户）。"""
+    """
+    pool_entry_id 为 null：解除该用户全部代理绑定。
+    否则绑定到指定池条目。exclusive=True（默认）：独占——先解除该用户其它条目再绑定本条。
+    exclusive=False：追加绑定（须 MULTI_PROXY_PER_USER_ENABLED）；不解除已有绑定。
+    """
 
     pool_entry_id: Optional[int] = None
+    exclusive: bool = True
+
+
+class AdminMultiProxyPolicyOut(BaseModel):
+    multi_proxy_per_user_enabled: bool
 
 
 class AdminAliyunRunInstancesIn(BaseModel):

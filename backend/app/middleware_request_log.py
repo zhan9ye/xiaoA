@@ -12,6 +12,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -121,12 +122,74 @@ def setup_request_file_logger() -> logging.Logger:
     return lg
 
 
+def log_httpx_outbound_request_error_sync(
+    *,
+    method: str,
+    url: str,
+    req_body: str,
+    err: str,
+    platform_user_id: Optional[int] = None,
+    proxy_label: Optional[str] = None,
+    uses_outbound_proxy: bool = False,
+    proxy_debug: Optional[str] = None,
+) -> None:
+    """
+    httpx 在收到 Response 前失败（超时、断连等 RequestError）时不会触发 response 事件钩子；
+    用本函数补一条与成功响应日志风格一致的 OUTBOUND 记录（无 RESPONSE 行，错误写入 body=）。
+    """
+    if not settings.request_log_enabled:
+        return
+    if not _outbound_host_patterns():
+        return
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return
+    if not outbound_host_matches(host):
+        return
+
+    setup_request_file_logger()
+    if not _http_request_file_handler_ok or _logger is None:
+        return
+
+    lg = _logger
+    max_body = max(4096, int(settings.request_log_max_body))
+    body_out = (req_body or "")[:max_body]
+    if len(req_body or "") > max_body:
+        body_out += f" [BODY_TRUNCATED total_chars={len(req_body)}]"
+
+    uid_part = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
+    lab = (proxy_label or "").strip()
+    if uses_outbound_proxy:
+        lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
+    else:
+        lab_part = "proxy_label=direct"
+    dbg = (proxy_debug or "").strip()
+    dbg_part = f" | {dbg}" if dbg else ""
+    who = f"{uid_part} | {lab_part}{dbg_part}"
+    err_one = (err or "").strip().replace("\n", " ")
+    if not err_one:
+        err_one = "(request error with empty message)"
+    if len(err_one) > 2000:
+        err_one = err_one[:2000] + "…"
+
+    lg.info(
+        "%s | OUTBOUND %s %s | req_body=%s\nRESPONSE status=0 content-type= | body=%s",
+        who,
+        method,
+        url,
+        body_out,
+        err_one,
+    )
+
+
 async def httpx_outbound_response_log_hook(
     response: httpx.Response,
     *,
     platform_user_id: Optional[int] = None,
     proxy_label: Optional[str] = None,
     uses_outbound_proxy: bool = False,
+    proxy_debug: Optional[str] = None,
 ) -> None:
     if not settings.request_log_enabled:
         return
@@ -180,7 +243,9 @@ async def httpx_outbound_response_log_hook(
         lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
     else:
         lab_part = "proxy_label=direct"
-    who = f"{uid_part} | {lab_part}"
+    dbg = (proxy_debug or "").strip()
+    dbg_part = f" | {dbg}" if dbg else ""
+    who = f"{uid_part} | {lab_part}{dbg_part}"
 
     lg.info(
         "%s | OUTBOUND %s %s | req_body=%s\nRESPONSE status=%s content-type=%s | body=%s",
