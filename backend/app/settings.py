@@ -105,6 +105,8 @@ class Settings(BaseSettings):
     proxy_auto_purchase_hour: int = 11
     proxy_auto_purchase_minute: int = 30
     proxy_auto_purchase_multiplier: int = 1
+    # 进程启动时是否立即跑一轮购机（false=仅在北京时间 PROXY_AUTO_PURCHASE_HOUR:MINUTE 执行）
+    proxy_auto_purchase_run_on_startup: bool = False  # PROXY_AUTO_PURCHASE_RUN_ON_STARTUP
     # 自动购机入库后等待该秒数再探测；补购后也等待同样时间再探测
     proxy_auto_purchase_probe_delay_seconds: float = 120.0  # PROXY_AUTO_PURCHASE_PROBE_DELAY_SECONDS
     # 探测—释放—补购的最大轮数，超限则留有未放行条目并在日志告警

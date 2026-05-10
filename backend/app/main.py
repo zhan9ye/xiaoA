@@ -252,15 +252,19 @@ _proxy_auto_release_stop: Optional[asyncio.Event] = None
 
 async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
     """
-    每日北京时间定时自动购机：
-    - 启动时若开关开启，先执行一次（开启后立即生效）
-    - 之后每天 HH:MM 执行一次
+    每日北京时间定时自动购机（HH:MM 见 settings）：
+    - 若 PROXY_AUTO_PURCHASE_RUN_ON_STARTUP=true：进程启动当天若尚未跑过，会先执行一轮（便于部署后立即对齐池）
+    - 否则仅在每天到达设定时刻执行一次
     """
     last_run_date = ""
     while not stop_event.is_set():
         pol = await get_auto_purchase_policy()
         today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-        if pol["enabled"] and last_run_date != today:
+        if (
+            settings.proxy_auto_purchase_run_on_startup
+            and pol["enabled"]
+            and last_run_date != today
+        ):
             try:
                 await auto_purchase_proxies_once(trigger="startup")
             except Exception as ex:
