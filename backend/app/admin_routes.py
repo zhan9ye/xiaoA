@@ -27,6 +27,8 @@ from app.schemas import (
     AdminAliyunRunInstancesIn,
     AdminAliyunRunInstancesOut,
     AdminProxyPoolDeleteOut,
+    AdminProxyAutoPurchasePolicyIn,
+    AdminProxyAutoPurchasePolicyOut,
     AdminCreateUserIn,
     AdminLoginIn,
     AdminProxyPoolAddIn,
@@ -58,6 +60,7 @@ from app.services.aliyun_ecs_ops import (
     list_ecs_instances_page_sync,
     run_instances_then_poll_public_ips_sync,
 )
+from app.services.proxy_auto_purchase import get_auto_purchase_policy, set_auto_purchase_policy
 from app.runner_lifecycle import (
     runner_execute_start_core,
     runner_execute_stop,
@@ -181,6 +184,33 @@ async def admin_impersonate_policy(_auth: None = Depends(require_admin)) -> Admi
 async def admin_multi_proxy_policy(_auth: None = Depends(require_admin)) -> AdminMultiProxyPolicyOut:
     """是否允许多条代理追加绑定（与 .env MULTI_PROXY_PER_USER_ENABLED 一致）。"""
     return AdminMultiProxyPolicyOut(multi_proxy_per_user_enabled=bool(settings.multi_proxy_per_user_enabled))
+
+
+@router.get("/proxy-auto-purchase-policy", response_model=AdminProxyAutoPurchasePolicyOut)
+async def admin_proxy_auto_purchase_policy_get(
+    _auth: None = Depends(require_admin),
+) -> AdminProxyAutoPurchasePolicyOut:
+    p = await get_auto_purchase_policy()
+    return AdminProxyAutoPurchasePolicyOut(
+        enabled=bool(p["enabled"]),
+        multiplier=int(p["multiplier"]),
+        default_enabled=bool(p["default_enabled"]),
+        default_multiplier=int(p["default_multiplier"]),
+    )
+
+
+@router.put("/proxy-auto-purchase-policy", response_model=AdminProxyAutoPurchasePolicyOut)
+async def admin_proxy_auto_purchase_policy_put(
+    body: AdminProxyAutoPurchasePolicyIn,
+    _auth: None = Depends(require_admin),
+) -> AdminProxyAutoPurchasePolicyOut:
+    p = await set_auto_purchase_policy(enabled=bool(body.enabled), multiplier=int(body.multiplier))
+    return AdminProxyAutoPurchasePolicyOut(
+        enabled=bool(p["enabled"]),
+        multiplier=int(p["multiplier"]),
+        default_enabled=bool(p["default_enabled"]),
+        default_multiplier=int(p["default_multiplier"]),
+    )
 
 
 @router.get("/proxy-pool", response_model=AdminProxyPoolListOut)

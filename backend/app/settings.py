@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     aliyun_region_id: str = ""
     aliyun_ecs_launch_template_id: str = ""
     aliyun_ecs_launch_template_version: str = ""
+    # 每日自动购机：北京时间 HH:MM（默认 11:30）按「有效订阅且 runner_enabled=true」用户数 * 倍数购机
+    proxy_auto_purchase_enabled: bool = False
+    proxy_auto_purchase_hour: int = 11
+    proxy_auto_purchase_minute: int = 30
+    proxy_auto_purchase_multiplier: int = 1
+    # 每日自动释放代理服务器（默认北京时间 12:20；会跳过已锁定实例）
+    proxy_auto_release_enabled: bool = True
+    proxy_auto_release_hour: int = 12
+    proxy_auto_release_minute: int = 20
 
 
 settings = Settings()

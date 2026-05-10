@@ -65,6 +65,12 @@ from app.services.login_service import rpc_login
 from app.services.public_index_service import extract_main_account_info, post_public_index_data
 from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_deadline
 from app.services.runner import run_background
+from app.services.proxy_auto_purchase import (
+    auto_purchase_proxies_once,
+    auto_release_proxy_servers_once,
+    seconds_until_next_auto_buy,
+    seconds_until_next_auto_release,
+)
 from app.services.subaccount_service import FetchSubaccountsOutcome, fetch_all_subaccounts
 from app.services.totp_util import totp_now_from_secret_ex
 from app.settings import settings
@@ -237,8 +243,65 @@ async def _resume_runner_tasks() -> None:
         st.runner_task = asyncio.create_task(run_background(uid, cfg))
 
 
+_proxy_auto_purchase_task: Optional[asyncio.Task] = None
+_proxy_auto_purchase_stop: Optional[asyncio.Event] = None
+_proxy_auto_release_task: Optional[asyncio.Task] = None
+_proxy_auto_release_stop: Optional[asyncio.Event] = None
+
+
+async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
+    """
+    每日北京时间定时自动购机：
+    - 启动时若开关开启，先执行一次（开启后立即生效）
+    - 之后每天 HH:MM 执行一次
+    """
+    last_run_date = ""
+    while not stop_event.is_set():
+        if settings.proxy_auto_purchase_enabled:
+            today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+            if last_run_date != today:
+                try:
+                    await auto_purchase_proxies_once(trigger="startup")
+                except Exception as ex:
+                    print(f"[auto-proxy-buy] startup run failed: {ex!r}")
+                last_run_date = today
+        wait_s = seconds_until_next_auto_buy()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+            break
+        except asyncio.TimeoutError:
+            pass
+        if not settings.proxy_auto_purchase_enabled:
+            continue
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        if last_run_date == today:
+            continue
+        try:
+            await auto_purchase_proxies_once(trigger="daily-1130")
+        except Exception as ex:
+            print(f"[auto-proxy-buy] scheduled run failed: {ex!r}")
+        last_run_date = today
+
+
+async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
+    """每日北京时间 12:20 自动释放代理服务器（跳过锁定实例）。"""
+    while not stop_event.is_set():
+        wait_s = seconds_until_next_auto_release()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await auto_release_proxy_servers_once(trigger="daily-1220")
+        except Exception as ex:
+            print(f"[auto-proxy-release] scheduled run failed: {ex!r}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _proxy_auto_purchase_task, _proxy_auto_purchase_stop
+    global _proxy_auto_release_task, _proxy_auto_release_stop
     await init_db()
     if settings.jwt_secret == "dev-change-me":
         print("WARNING: 使用默认 JWT_SECRET，公网部署请在 .env 设置强随机 jwt_secret")
@@ -249,7 +312,35 @@ async def lifespan(app: FastAPI):
                 "出站 HTTP 日志：已启用（仅匹配 request_log_outbound_hosts），见 request_log_dir / http_requests.log"
             )
     await _resume_runner_tasks()
+    _proxy_auto_purchase_stop = asyncio.Event()
+    _proxy_auto_purchase_task = asyncio.create_task(_proxy_auto_purchase_loop(_proxy_auto_purchase_stop))
+    _proxy_auto_release_stop = asyncio.Event()
+    _proxy_auto_release_task = asyncio.create_task(_proxy_auto_release_loop(_proxy_auto_release_stop))
     yield
+    if _proxy_auto_purchase_stop is not None:
+        _proxy_auto_purchase_stop.set()
+    if _proxy_auto_purchase_task is not None:
+        _proxy_auto_purchase_task.cancel()
+        try:
+            await _proxy_auto_purchase_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        _proxy_auto_purchase_task = None
+        _proxy_auto_purchase_stop = None
+    if _proxy_auto_release_stop is not None:
+        _proxy_auto_release_stop.set()
+    if _proxy_auto_release_task is not None:
+        _proxy_auto_release_task.cancel()
+        try:
+            await _proxy_auto_release_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        _proxy_auto_release_task = None
+        _proxy_auto_release_stop = None
     await shutdown_all()
     from app.db import engine
 

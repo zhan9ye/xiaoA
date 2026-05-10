@@ -32,6 +32,13 @@ const impersonateBusyId = ref(null);
 /** 与 GET /api/admin/impersonate-policy 对齐；加载前按最严默认避免误放行 */
 const impersonatePolicy = ref({ enabled: true, require_password: true });
 const impersonatePwdModal = ref({ open: false, row: null, password: "" });
+const proxyAutoPurchasePolicy = ref({
+  enabled: false,
+  multiplier: 1,
+  default_enabled: false,
+  default_multiplier: 1,
+});
+const proxyAutoPurchaseBusy = ref(false);
 
 /** 阿里云 ECS：按启动模板创建（测试） */
 const ecsTestAmount = ref(1);
@@ -131,10 +138,70 @@ async function loadImpersonatePolicy() {
   }
 }
 
+async function loadProxyAutoPurchasePolicy() {
+  if (!token.value) return;
+  try {
+    const r = await fetch("/api/admin/proxy-auto-purchase-policy", { headers: headers() });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) return;
+    const j = await r.json();
+    proxyAutoPurchasePolicy.value = {
+      enabled: Boolean(j.enabled),
+      multiplier: Math.max(1, Number(j.multiplier) || 1),
+      default_enabled: Boolean(j.default_enabled),
+      default_multiplier: Math.max(1, Number(j.default_multiplier) || 1),
+    };
+  } catch {
+    /* ignore */
+  }
+}
+
+async function saveProxyAutoPurchasePolicy() {
+  actionMsg.value = "";
+  const payload = {
+    enabled: Boolean(proxyAutoPurchasePolicy.value.enabled),
+    multiplier: Math.max(1, Math.min(20, Number(proxyAutoPurchasePolicy.value.multiplier) || 1)),
+  };
+  proxyAutoPurchaseBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/proxy-auto-purchase-policy", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "保存自动购机策略失败";
+      return;
+    }
+    proxyAutoPurchasePolicy.value = {
+      enabled: Boolean(j.enabled),
+      multiplier: Math.max(1, Number(j.multiplier) || 1),
+      default_enabled: Boolean(j.default_enabled),
+      default_multiplier: Math.max(1, Number(j.default_multiplier) || 1),
+    };
+    actionMsg.value = `已保存自动购机：${j.enabled ? "开启" : "关闭"}，倍数 ${j.multiplier}`;
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    proxyAutoPurchaseBusy.value = false;
+  }
+}
+
 async function refreshAll() {
   await Promise.all([
     loadImpersonatePolicy(),
     loadMultiProxyPolicy(),
+    loadProxyAutoPurchasePolicy(),
     loadUsers(),
     loadProxyPool(),
     loadEcsList(),
@@ -916,6 +983,35 @@ onMounted(() => {
         <p v-if="actionMsg" class="mb-2 text-xs text-emerald-400/90">{{ actionMsg }}</p>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">出站代理池</h2>
+        <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+          <p class="mb-2 text-xs text-zinc-500">
+            自动购机策略（每日北京时间 11:30）：按「有效订阅且运行开启用户数 × 倍数」补足代理池。
+          </p>
+          <div class="flex flex-wrap items-end gap-2">
+            <label class="inline-flex items-center gap-2 text-xs text-zinc-300">
+              <input v-model="proxyAutoPurchasePolicy.enabled" type="checkbox" class="rounded border-zinc-600" />
+              开启自动购机
+            </label>
+            <label class="text-xs text-zinc-400">
+              倍数
+              <input
+                v-model.number="proxyAutoPurchasePolicy.multiplier"
+                type="number"
+                min="1"
+                max="20"
+                class="ml-1 w-20 rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs"
+              />
+            </label>
+            <button
+              type="button"
+              class="rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
+              :disabled="proxyAutoPurchaseBusy"
+              @click="saveProxyAutoPurchasePolicy"
+            >
+              {{ proxyAutoPurchaseBusy ? "保存中…" : "保存策略" }}
+            </button>
+          </div>
+        </div>
         <p class="mb-3 text-xs text-zinc-500">
           每条为完整 HTTP(S) 代理 URL，也支持无协议写法如 <code class="text-zinc-400">1.2.3.4:3128</code>（保存后内部按 HTTP 解析主机）。
           绑定到用户后 RPC 经此出口；表格「主机」列为解析后的 IP/域名与端口，编辑可改标签与完整 URL。

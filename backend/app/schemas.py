@@ -703,3 +703,15 @@ class AdminAliyunEcsPoolEntryFromInstanceOut(BaseModel):
 class AdminProxyPoolDeleteOut(BaseModel):
     ok: bool = True
     unbound_user_id: Optional[int] = Field(default=None, description="删除前已绑定用户则返回其 id")
+
+
+class AdminProxyAutoPurchasePolicyOut(BaseModel):
+    enabled: bool
+    multiplier: int = Field(ge=1, le=20)
+    default_enabled: bool
+    default_multiplier: int = Field(ge=1, le=20)
+
+
+class AdminProxyAutoPurchasePolicyIn(BaseModel):
+    enabled: bool
+    multiplier: int = Field(ge=1, le=20)
