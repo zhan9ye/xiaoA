@@ -56,6 +56,7 @@ const ecsAddPoolBusyId = ref("");
 const ecsLockBusyId = ref("");
 const ecsReleaseBusyId = ref("");
 const poolDeleteBusyId = ref(null);
+const poolProbeBusyId = ref(null);
 
 function headers() {
   return {
@@ -388,6 +389,35 @@ async function deleteProxyPoolEntry(p) {
   }
 }
 
+async function probeAkapi1LoginThroughPoolEntry(p) {
+  actionMsg.value = "";
+  poolProbeBusyId.value = p.id;
+  try {
+    const r = await fetch(`/api/admin/proxy-pool/${p.id}/probe-akapi1-login`, {
+      method: "POST",
+      headers: headers(),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "探测失败";
+      return;
+    }
+    const ok = Boolean(j.proxy_ok);
+    const hint = j.body_preview ? ` 片段：${j.body_preview}` : "";
+    actionMsg.value = ok
+      ? `探测 #${p.id}：通路正常（假账号返回「賬戶或密碼不正確」）`
+      : `探测 #${p.id}：不可用 — ${j.verdict_detail || j.verdict}（HTTP ${j.http_status || 0}）${hint}`;
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    poolProbeBusyId.value = null;
+  }
+}
+
 async function loadProxyPool() {
   poolErr.value = "";
   poolLoading.value = true;
@@ -645,6 +675,7 @@ function poolOptionsForBind() {
   const append = bindModal.value.appendOnly;
   return proxyEntries.value.filter((p) => {
     if (!p.is_active) return false;
+    if (!p.assignment_allowed) return false;
     if (append) return p.assigned_user_id == null;
     return p.assigned_user_id == null || p.assigned_user_id === uid;
   });
@@ -1015,6 +1046,9 @@ onMounted(() => {
         <p class="mb-3 text-xs text-zinc-500">
           每条为完整 HTTP(S) 代理 URL，也支持无协议写法如 <code class="text-zinc-400">1.2.3.4:3128</code>（保存后内部按 HTTP 解析主机）。
           绑定到用户后 RPC 经此出口；表格「主机」列为解析后的 IP/域名与端口，编辑可改标签与完整 URL。
+          「探测 Login」经该代理 POST <code class="text-zinc-400">/RPC/Login</code>，使用固定假账号
+          <code class="text-zinc-400">你的账号</code>/<code class="text-zinc-400">你的密码</code>：若 HTTP 403 则出口不可用；若返回
+          <code class="text-zinc-400">Error=true</code> 且提示賬戶或密碼不正確 则通路正常。
         </p>
         <div class="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
           <div class="mb-3 flex flex-wrap gap-2">
@@ -1046,6 +1080,7 @@ onMounted(() => {
                   <th class="px-2 py-2 font-medium">标签</th>
                   <th class="px-2 py-2 font-medium">主机</th>
                   <th class="px-2 py-2 font-medium">绑定用户</th>
+                  <th class="px-2 py-2 font-medium">放行</th>
                   <th class="px-2 py-2 font-medium">状态</th>
                   <th class="px-2 py-2 font-medium">操作</th>
                 </tr>
@@ -1062,12 +1097,29 @@ onMounted(() => {
                     <span v-else class="text-zinc-600">空闲</span>
                   </td>
                   <td class="px-2 py-2">
+                    <span
+                      :class="
+                        p.assignment_allowed ? 'text-emerald-400/90' : 'text-amber-400/85'
+                      "
+                    >
+                      {{ p.assignment_allowed ? "已探测" : "待探测" }}
+                    </span>
+                  </td>
+                  <td class="px-2 py-2">
                     <span :class="p.is_active ? 'text-emerald-500/90' : 'text-zinc-500'">
                       {{ p.is_active ? "启用" : "停用" }}
                     </span>
                   </td>
                   <td class="px-2 py-2">
                     <div class="flex flex-wrap gap-1">
+                      <button
+                        type="button"
+                        class="rounded border border-emerald-900/50 px-1.5 py-0.5 text-emerald-400/90 hover:bg-emerald-950/30 disabled:opacity-40"
+                        :disabled="poolProbeBusyId === p.id"
+                        @click="probeAkapi1LoginThroughPoolEntry(p)"
+                      >
+                        {{ poolProbeBusyId === p.id ? "探测中…" : "探测 Login" }}
+                      </button>
                       <button
                         type="button"
                         class="rounded border border-zinc-600 px-1.5 py-0.5 hover:bg-zinc-800"

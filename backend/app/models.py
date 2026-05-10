@@ -69,6 +69,8 @@ class ProxyPoolEntry(Base):
         nullable=True,
         index=True,
     )
+    # 自动购机入库时先为 False，经 akapi1 Login 探测通过后才可为 True；未通过前不得分配给平台用户。
+    assignment_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class RunnerLease(Base):

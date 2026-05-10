@@ -10,13 +10,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AsyncSessionLocal
 from app.models import ProxyPoolEntry
+from app.services.proxy_auto_purchase import get_auto_purchase_policy
 from app.settings import settings
 from app.user_registry import get_or_create_session_manager
 
 
-async def _active_pool_count(db: AsyncSession) -> int:
+async def _assignable_idle_count(db: AsyncSession) -> int:
+    """可被自动领取的空闲条目：启用 + 已放行分配 + 未绑定。"""
     r = await db.execute(
-        select(func.count()).select_from(ProxyPoolEntry).where(ProxyPoolEntry.is_active.is_(True))
+        select(func.count())
+        .select_from(ProxyPoolEntry)
+        .where(
+            ProxyPoolEntry.is_active.is_(True),
+            ProxyPoolEntry.assignment_allowed.is_(True),
+            ProxyPoolEntry.assigned_user_id.is_(None),
+        )
     )
     return int(r.scalar_one() or 0)
 
@@ -39,10 +47,10 @@ async def _list_user_proxy_rows(db: AsyncSession, user_id: int) -> List[ProxyPoo
 async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[str, Optional[str]]]:
     """
     返回 [(proxy_url, label), ...] 仅含启用条目的非空 URL。
-    若无绑定且池非空：原子领取一条空闲记录（与旧版一致）。
-    若关闭 MULTI_PROXY_PER_USER_ENABLED 且有多条绑定，仅返回第一条（会话单出口）。
+    若无绑定且开启 PROXY_POOL_AUTO_ASSIGN：按自动购机策略倍数领取空闲条目（与 MULTIPLIER 一致，上限 20）；
+    若关闭 MULTI_PROXY_PER_USER_ENABLED，仍只领取 1 条（会话单出口）。
     """
-    rows = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active]
+    rows = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active and e.assignment_allowed]
     out: List[Tuple[str, Optional[str]]] = []
     for e in rows:
         u, lab = _proxy_url_and_label(e)
@@ -56,25 +64,32 @@ async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[
     if not bool(settings.proxy_pool_auto_assign):
         return []
 
-    n = await _active_pool_count(db)
-    if n == 0:
-        return []
+    policy = await get_auto_purchase_policy()
+    want = max(1, min(20, int(policy.get("multiplier") or 1)))
+    if not bool(settings.multi_proxy_per_user_enabled):
+        want = 1
 
-    res = await db.execute(
-        text(
-            """
-            UPDATE proxy_pool_entries SET assigned_user_id = :uid
-            WHERE id = (
-                SELECT id FROM proxy_pool_entries
-                WHERE assigned_user_id IS NULL AND is_active = 1
-                ORDER BY id ASC LIMIT 1
-            )
-            """
-        ),
-        {"uid": user_id},
-    )
-    rc = getattr(res, "rowcount", None)
-    if rc == 0:
+    assigned = 0
+    for _ in range(want):
+        res = await db.execute(
+            text(
+                """
+                UPDATE proxy_pool_entries SET assigned_user_id = :uid
+                WHERE id = (
+                    SELECT id FROM proxy_pool_entries
+                    WHERE assigned_user_id IS NULL AND is_active = 1 AND assignment_allowed = 1
+                    ORDER BY id ASC LIMIT 1
+                )
+                """
+            ),
+            {"uid": user_id},
+        )
+        rc = int(getattr(res, "rowcount", None) or 0)
+        if rc == 0:
+            break
+        assigned += 1
+
+    if assigned == 0:
         if settings.proxy_pool_require_available:
             raise HTTPException(
                 status_code=503,
@@ -82,7 +97,7 @@ async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[
             )
         return []
 
-    rows2 = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active]
+    rows2 = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active and e.assignment_allowed]
     out2: List[Tuple[str, Optional[str]]] = []
     for e in rows2:
         u, lab = _proxy_url_and_label(e)

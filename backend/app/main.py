@@ -68,6 +68,7 @@ from app.services.runner import run_background
 from app.services.proxy_auto_purchase import (
     auto_purchase_proxies_once,
     auto_release_proxy_servers_once,
+    get_auto_purchase_policy,
     seconds_until_next_auto_buy,
     seconds_until_next_auto_release,
 )
@@ -257,30 +258,31 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
     """
     last_run_date = ""
     while not stop_event.is_set():
-        if settings.proxy_auto_purchase_enabled:
-            today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-            if last_run_date != today:
-                try:
-                    await auto_purchase_proxies_once(trigger="startup")
-                except Exception as ex:
-                    print(f"[auto-proxy-buy] startup run failed: {ex!r}")
-                last_run_date = today
+        pol = await get_auto_purchase_policy()
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        if pol["enabled"] and last_run_date != today:
+            try:
+                await auto_purchase_proxies_once(trigger="startup")
+            except Exception as ex:
+                print(f"[auto-proxy-buy] startup run failed: {ex!r}")
+            last_run_date = today
         wait_s = seconds_until_next_auto_buy()
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
             break
         except asyncio.TimeoutError:
             pass
-        if not settings.proxy_auto_purchase_enabled:
+        pol2 = await get_auto_purchase_policy()
+        if not pol2["enabled"]:
             continue
-        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-        if last_run_date == today:
+        today2 = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        if last_run_date == today2:
             continue
         try:
             await auto_purchase_proxies_once(trigger="daily-1130")
         except Exception as ex:
             print(f"[auto-proxy-buy] scheduled run failed: {ex!r}")
-        last_run_date = today
+        last_run_date = today2
 
 
 async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:

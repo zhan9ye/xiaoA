@@ -36,6 +36,7 @@ _RULES: List[Tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/admin/proxy-pool$"), "列出出站代理池"),
     ("POST", re.compile(r"^/api/admin/proxy-pool$"), "新增代理池条目"),
     ("PATCH", re.compile(r"^/api/admin/proxy-pool/\d+$"), "修改代理池条目（启用状态、标签、URL 等）"),
+    ("POST", re.compile(r"^/api/admin/proxy-pool/\d+/probe-akapi1-login$"), "探测代理访问 akapi1 Login（固定假账号）"),
     ("DELETE", re.compile(r"^/api/admin/proxy-pool/\d+$"), "删除代理池条目"),
     ("GET", re.compile(r"^/api/admin/aliyun-ecs/instances$"), "分页列出阿里云 ECS 实例"),
     ("PUT", re.compile(r"^/api/admin/aliyun-ecs/instance-lock$"), "锁定或解锁 ECS 实例（防误删）"),

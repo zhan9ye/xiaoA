@@ -580,6 +580,10 @@ class AdminProxyPoolRow(BaseModel):
     proxy_url: str
     label: str
     is_active: bool
+    assignment_allowed: bool = Field(
+        True,
+        description="为 False 时表示尚未通过出站 Login 探测，不能被自动领取绑定",
+    )
     assigned_user_id: Optional[int] = None
     assigned_username: Optional[str] = None
     proxy_host_preview: str = ""
@@ -594,6 +598,18 @@ class AdminProxyPoolPatchIn(BaseModel):
     release_assigned: bool = False
     label: Optional[str] = None
     proxy_url: Optional[str] = None
+
+
+class AdminProxyAkapi1ProbeOut(BaseModel):
+    """经池条目 proxy 出站 POST akapi1 /RPC/Login（假账号），用于判断是否 403。"""
+
+    pool_entry_id: int
+    proxy_url: str
+    proxy_ok: bool = Field(description="为 True 表示收到「賬戶或密碼不正確」JSON，通路正常")
+    http_status: int = 0
+    verdict: str = Field(description="机器可读分类，如 wrong_password_json / http_403 / request_error")
+    verdict_detail: str = ""
+    body_preview: str = ""
 
 
 class AdminUserProxyIn(BaseModel):

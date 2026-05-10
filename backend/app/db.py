@@ -174,14 +174,15 @@ async def init_db() -> None:
                         proxy_url TEXT NOT NULL,
                         label VARCHAR(128) NOT NULL DEFAULT '',
                         is_active INTEGER NOT NULL DEFAULT 1,
-                        assigned_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                        assigned_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                        assignment_allowed INTEGER NOT NULL DEFAULT 1
                     )
                     """
                 )
                 await conn.exec_driver_sql(
                     """
-                    INSERT INTO proxy_pool_entries__new (id, proxy_url, label, is_active, assigned_user_id)
-                    SELECT id, proxy_url, label, is_active, assigned_user_id FROM proxy_pool_entries
+                    INSERT INTO proxy_pool_entries__new (id, proxy_url, label, is_active, assigned_user_id, assignment_allowed)
+                    SELECT id, proxy_url, label, is_active, assigned_user_id, 1 FROM proxy_pool_entries
                     """
                 )
                 await conn.exec_driver_sql("DROP TABLE proxy_pool_entries")
@@ -189,6 +190,15 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "CREATE INDEX IF NOT EXISTS ix_proxy_pool_entries_assigned_user_id "
                     "ON proxy_pool_entries(assigned_user_id)"
+                )
+
+            prow_pp = (
+                await conn.exec_driver_sql("PRAGMA table_info('proxy_pool_entries')")
+            ).fetchall()
+            pp_cols = {str(r[1]) for r in (prow_pp or [])}
+            if "assignment_allowed" not in pp_cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE proxy_pool_entries ADD COLUMN assignment_allowed INTEGER NOT NULL DEFAULT 1"
                 )
 
             try:

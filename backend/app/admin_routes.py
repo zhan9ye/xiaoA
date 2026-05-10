@@ -27,6 +27,7 @@ from app.schemas import (
     AdminAliyunRunInstancesIn,
     AdminAliyunRunInstancesOut,
     AdminProxyPoolDeleteOut,
+    AdminProxyAkapi1ProbeOut,
     AdminProxyAutoPurchasePolicyIn,
     AdminProxyAutoPurchasePolicyOut,
     AdminCreateUserIn,
@@ -60,6 +61,7 @@ from app.services.aliyun_ecs_ops import (
     list_ecs_instances_page_sync,
     run_instances_then_poll_public_ips_sync,
 )
+from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
 from app.services.proxy_auto_purchase import get_auto_purchase_policy, set_auto_purchase_policy
 from app.runner_lifecycle import (
     runner_execute_start_core,
@@ -232,6 +234,7 @@ async def admin_proxy_pool_list(
                 proxy_url=e.proxy_url,
                 label=e.label or "",
                 is_active=bool(e.is_active),
+                assignment_allowed=bool(getattr(e, "assignment_allowed", True)),
                 assigned_user_id=e.assigned_user_id,
                 assigned_username=uname,
                 proxy_host_preview=_proxy_host_preview(e.proxy_url),
@@ -278,6 +281,8 @@ async def admin_proxy_pool_patch(
         nu = body.proxy_url.strip()
         if not nu:
             raise HTTPException(status_code=400, detail="proxy_url 不能为空")
+        if nu != ((entry.proxy_url or "").strip()):
+            entry.assignment_allowed = False
         entry.proxy_url = nu
         if entry.assigned_user_id is not None:
             prev_uid = entry.assigned_user_id
@@ -285,6 +290,38 @@ async def admin_proxy_pool_patch(
     if prev_uid is not None:
         await invalidate_user_outbound_session(prev_uid)
     return {"ok": True}
+
+
+@router.post("/proxy-pool/{entry_id}/probe-akapi1-login", response_model=AdminProxyAkapi1ProbeOut)
+async def admin_proxy_pool_probe_akapi1_login(
+    entry_id: int,
+    _auth: None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminProxyAkapi1ProbeOut:
+    """
+    经该池条目的代理 URL 出站，POST akapi1 Login（固定假账号「你的账号」「你的密码」）。
+    - 403：判定该出口不可用；
+    - 200 且返回 Error=true、Msg 为賬戶或密碼不正確：判定通路正常。
+    """
+    entry = await db.get(ProxyPoolEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="池条目不存在")
+    r = await probe_akapi1_login_via_proxy(entry.proxy_url)
+    ok = bool(r.get("proxy_ok"))
+    if ok:
+        entry.assignment_allowed = True
+        await db.commit()
+        await db.refresh(entry)
+    out = AdminProxyAkapi1ProbeOut(
+        pool_entry_id=entry_id,
+        proxy_url=entry.proxy_url,
+        proxy_ok=ok,
+        http_status=int(r.get("http_status") or 0),
+        verdict=str(r.get("verdict") or ""),
+        verdict_detail=str(r.get("verdict_detail") or ""),
+        body_preview=str(r.get("body_preview") or ""),
+    )
+    return out
 
 
 @router.delete("/proxy-pool/{entry_id}", response_model=AdminProxyPoolDeleteOut)
@@ -527,6 +564,11 @@ async def admin_set_user_proxy(
             raise HTTPException(status_code=404, detail="池条目不存在")
         if not entry.is_active:
             raise HTTPException(status_code=400, detail="该代理条目已停用，请先在池中启用")
+        if not bool(getattr(entry, "assignment_allowed", True)):
+            raise HTTPException(
+                status_code=400,
+                detail="该条目尚未通过出站探测放行，请先对池条目「探测 Login」成功后再绑定",
+            )
         if entry.assigned_user_id is not None and entry.assigned_user_id != user_id:
             raise HTTPException(status_code=400, detail="该代理已被其他用户占用")
         st = await get_or_create_state(user_id)
@@ -565,6 +607,11 @@ async def admin_set_user_proxy(
         raise HTTPException(status_code=404, detail="池条目不存在")
     if not entry.is_active:
         raise HTTPException(status_code=400, detail="该代理条目已停用，请先在池中启用")
+    if not bool(getattr(entry, "assignment_allowed", True)):
+        raise HTTPException(
+            status_code=400,
+            detail="该条目尚未通过出站探测放行，请先对池条目「探测 Login」成功后再绑定",
+        )
     if entry.assigned_user_id is not None and entry.assigned_user_id != user_id:
         raise HTTPException(status_code=400, detail="该代理已被其他用户占用")
 
