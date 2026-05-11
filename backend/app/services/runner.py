@@ -936,7 +936,6 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
 
     state = await get_or_create_state(user_id)
     log_hub: LogHub = await get_or_create_log_hub(user_id)
-    sm = await get_session_manager_for_user_id(user_id)
     lease_holder = get_runner_lease_holder_id()
 
     state.last_runner_error = None
@@ -946,6 +945,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
         interval = float(settings.runner_loop_interval_seconds)
 
         while not state.stop_event.is_set():
+            # 每轮从 DB 同步代理绑定：启动时可能尚无绑定，或管理端后续绑定/调用了 invalidate；
+            # 若只在 run_background 入口取一次 sm，会永久直连（与 http_requests.log 中 proxy_label=direct 一致）。
+            sm = await get_session_manager_for_user_id(user_id)
             cfg: Optional[AppConfigIn] = state.config
             if cfg is None:
                 await log_hub.push(LogLevel.error, "配置丢失，停止任务")
