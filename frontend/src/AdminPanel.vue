@@ -1018,24 +1018,28 @@ onMounted(() => {
           <p class="mb-2 text-xs text-zinc-500">
             自动购机策略（每日北京时间 11:30）：按「有效订阅且运行开启用户数 × 倍数」补足代理池。
           </p>
-          <div class="flex flex-wrap gap-2">
-            <label class="inline-flex items-center gap-2 text-xs text-zinc-300">
-              <input v-model="proxyAutoPurchasePolicy.enabled" type="checkbox" class="rounded border-zinc-600" />
+          <div class="flex flex-wrap items-center gap-3">
+            <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+              <input
+                v-model="proxyAutoPurchasePolicy.enabled"
+                type="checkbox"
+                class="h-4 w-4 shrink-0 rounded border-zinc-600"
+              />
               开启自动购机
             </label>
-            <label class="text-xs text-zinc-400">
-              倍数
+            <label class="inline-flex items-center gap-2 text-xs text-zinc-400">
+              <span class="shrink-0">倍数</span>
               <input
                 v-model.number="proxyAutoPurchasePolicy.multiplier"
                 type="number"
                 min="1"
                 max="20"
-                class="ml-1 w-20 rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs"
+                class="w-20 rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs leading-none"
               />
             </label>
             <button
               type="button"
-              class="rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
+              class="inline-flex shrink-0 items-center justify-center rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs leading-none text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
               :disabled="proxyAutoPurchaseBusy"
               @click="saveProxyAutoPurchasePolicy"
             >
