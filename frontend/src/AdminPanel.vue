@@ -1018,7 +1018,7 @@ onMounted(() => {
           <p class="mb-2 text-xs text-zinc-500">
             自动购机策略（每日北京时间 11:30）：按「有效订阅且运行开启用户数 × 倍数」补足代理池。
           </p>
-          <div class="flex flex-wrap items-end gap-2">
+          <div class="flex flex-wrap gap-2">
             <label class="inline-flex items-center gap-2 text-xs text-zinc-300">
               <input v-model="proxyAutoPurchasePolicy.enabled" type="checkbox" class="rounded border-zinc-600" />
               开启自动购机
