@@ -50,7 +50,8 @@ async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[
     若无绑定且开启 PROXY_POOL_AUTO_ASSIGN：按自动购机策略倍数领取空闲条目（与 MULTIPLIER 一致，上限 20）；
     若关闭 MULTI_PROXY_PER_USER_ENABLED，仍只领取 1 条（会话单出口）。
     """
-    rows = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active and e.assignment_allowed]
+    # 已绑定给该用户的条目：只要 is_active 就可用（assignment_allowed 仅控制"能否被新用户自动领取"）
+    rows = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active]
     out: List[Tuple[str, Optional[str]]] = []
     for e in rows:
         u, lab = _proxy_url_and_label(e)
@@ -97,7 +98,7 @@ async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[
             )
         return []
 
-    rows2 = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active and e.assignment_allowed]
+    rows2 = [e for e in await _list_user_proxy_rows(db, user_id) if e.is_active]
     out2: List[Tuple[str, Optional[str]]] = []
     for e in rows2:
         u, lab = _proxy_url_and_label(e)

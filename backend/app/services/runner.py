@@ -998,6 +998,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                 if state.stop_event.is_set():
                     break
 
+                # 等待结束后重新拉取代理绑定：等待期间自动购机可能完成了分配
+                sm = await get_session_manager_for_user_id(user_id)
+
                 skip_prep_fetch = sell_started and bool(state.subaccounts_cache) and (
                     state.runner_sub_prep_date == today_bj
                     or not (state.runner_sub_prep_date or "").strip()
@@ -1097,6 +1100,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                 if cfg is None:
                     break
 
+                # 进入售卖前再次同步代理（prep/warmup 期间可能有新的代理绑定）
+                sm = await get_session_manager_for_user_id(user_id)
+
                 if state.runner_must_refresh_trading_cache:
                     await log_hub.push(
                         LogLevel.info,
@@ -1174,6 +1180,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
             cfg = state.config
             if cfg is None:
                 break
+
+            # 进入售卖前同步代理绑定
+            sm = await get_session_manager_for_user_id(user_id)
 
             if state.runner_must_refresh_trading_cache:
                 await log_hub.push(
