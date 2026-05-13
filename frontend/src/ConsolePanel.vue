@@ -150,7 +150,10 @@ let googleCodeTimer = null;
 const toastMessage = ref("");
 const toastVisible = ref(false);
 const toastVariant = ref("info");
+const toastPlacement = ref("default");
 let toastTimer = null;
+
+const CREDENTIAL_SAVE_ERROR_TOAST = "登录账号或者密码不正确，请重新填写！";
 
 function showToast(msg, options = {}) {
   if (!msg) return;
@@ -158,12 +161,14 @@ function showToast(msg, options = {}) {
   const durationMs = Number(options.durationMs) > 0 ? Number(options.durationMs) : variant === "error" ? 5000 : 3000;
   toastMessage.value = msg;
   toastVariant.value = variant;
+  toastPlacement.value = options.placement === "lower" ? "lower" : "default";
   toastVisible.value = true;
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     toastVisible.value = false;
     toastMessage.value = "";
     toastVariant.value = "info";
+    toastPlacement.value = "default";
     toastTimer = null;
   }, durationMs);
 }
@@ -1109,7 +1114,11 @@ async function saveConfig() {
       saveMsg.value = credMsg
         ? `其他配置已保存；登录账号或密码未保存：${credMsg}`
         : "其他配置已保存；登录账号或密码未保存";
-      showToast(saveMsg.value, { variant: "error", durationMs: 5000 });
+      showToast(CREDENTIAL_SAVE_ERROR_TOAST, {
+        variant: "error",
+        durationMs: 5000,
+        placement: "lower",
+      });
       return;
     }
     saveMsg.value = "已保存";
@@ -2173,17 +2182,21 @@ onMounted(async () => {
   <Teleport to="body">
     <div
       v-if="toastVisible"
-      class="pointer-events-none fixed left-1/2 top-6 z-[500] -translate-x-1/2 px-4"
+      class="pointer-events-none fixed left-1/2 z-[500] -translate-x-1/2 px-3 sm:px-4"
+      :class="toastPlacement === 'lower' ? 'top-20 sm:top-24' : 'top-6'"
       role="status"
       aria-live="polite"
     >
       <div
-        class="pointer-events-auto max-w-[min(90vw,24rem)] rounded-xl border px-4 py-3 text-center text-sm shadow-xl backdrop-blur-sm"
-        :class="
+        class="pointer-events-auto rounded-xl border px-4 py-3 text-center text-sm shadow-xl backdrop-blur-sm"
+        :class="[
           toastVariant === 'error'
-            ? 'border-amber-500/70 bg-amber-950/95 text-amber-50'
-            : 'border-zinc-600 bg-zinc-900/95 text-zinc-100'
-        "
+            ? 'border-red-500/80 bg-red-950/95 text-red-50'
+            : 'border-zinc-600 bg-zinc-900/95 text-zinc-100',
+          toastPlacement === 'lower'
+            ? 'w-[min(96vw,28rem)] max-w-none sm:w-auto sm:max-w-[min(90vw,24rem)]'
+            : 'max-w-[min(90vw,24rem)]',
+        ]"
       >
         {{ toastMessage }}
       </div>
