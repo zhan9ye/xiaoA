@@ -112,9 +112,6 @@ const switchConfirmErr = ref("");
 const configCollapsed = ref(false);
 const runParamsCollapsed = ref(false);
 
-const LS_CONFIG_COLLAPSED = "xiaoA_console_config_collapsed";
-const LS_RUN_PARAMS_COLLAPSED = "xiaoA_console_run_params_collapsed";
-
 /** GET /api/credits/overview */
 const creditsOverview = ref(null);
 /** false：套餐列表仅展示前 2 个；true：展示全部 */
@@ -152,18 +149,23 @@ let googleCodeTimer = null;
 
 const toastMessage = ref("");
 const toastVisible = ref(false);
+const toastVariant = ref("info");
 let toastTimer = null;
 
-function showToast(msg) {
+function showToast(msg, options = {}) {
   if (!msg) return;
+  const variant = options.variant === "error" ? "error" : "info";
+  const durationMs = Number(options.durationMs) > 0 ? Number(options.durationMs) : variant === "error" ? 5000 : 3000;
   toastMessage.value = msg;
+  toastVariant.value = variant;
   toastVisible.value = true;
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     toastVisible.value = false;
     toastMessage.value = "";
+    toastVariant.value = "info";
     toastTimer = null;
-  }, 3000);
+  }, durationMs);
 }
 
 function goToContact() {
@@ -1101,25 +1103,19 @@ async function saveConfig() {
     syncSellSortChoiceFromRefs();
     if (saved.password != null) tradePassword.value = String(saved.password);
     if (saved.username != null) tradeUser.value = String(saved.username);
-    const credSaved = saved.credentials_saved !== false;
     const credMsg = saved.credentials_message != null ? String(saved.credentials_message).trim() : "";
-    if (credSaved) {
-      saveMsg.value = "已保存";
-      showToast("交易端配置已保存");
-    } else {
+    const credSaved = saved.credentials_saved !== false && !credMsg;
+    if (!credSaved) {
       saveMsg.value = credMsg
         ? `其他配置已保存；登录账号或密码未保存：${credMsg}`
         : "其他配置已保存；登录账号或密码未保存";
-      showToast(saveMsg.value);
+      showToast(saveMsg.value, { variant: "error", durationMs: 5000 });
+      return;
     }
-    try {
-      localStorage.setItem(LS_CONFIG_COLLAPSED, "1");
-    } catch (_) {}
-    configCollapsed.value = true;
-    if (credSaved) {
-      connectWs();
-      await loadSubaccounts();
-    }
+    saveMsg.value = "已保存";
+    showToast("交易端配置已保存");
+    connectWs();
+    await loadSubaccounts();
   } catch {
     saveMsg.value = "网络错误";
   }
@@ -1176,10 +1172,6 @@ async function saveRunParams(successToast = "") {
     syncSellSortChoiceFromRefs();
     saveRunParamsMsg.value = "已保存";
     showToast(successToast || "运行参数已保存");
-    try {
-      localStorage.setItem(LS_RUN_PARAMS_COLLAPSED, "1");
-    } catch (_) {}
-    runParamsCollapsed.value = true;
     return true;
   } catch {
     saveRunParamsMsg.value = "网络错误";
@@ -1365,10 +1357,6 @@ watch(
   () => props.token,
   async () => {
     logs.value = [];
-    try {
-      if (localStorage.getItem(LS_CONFIG_COLLAPSED) === "1") configCollapsed.value = true;
-      if (localStorage.getItem(LS_RUN_PARAMS_COLLAPSED) === "1") runParamsCollapsed.value = true;
-    } catch (_) {}
     await loadMe();
     await loadCreditsOverview();
     await loadConfig();
@@ -1379,10 +1367,6 @@ watch(
 );
 
 onMounted(async () => {
-  try {
-    if (localStorage.getItem(LS_CONFIG_COLLAPSED) === "1") configCollapsed.value = true;
-    if (localStorage.getItem(LS_RUN_PARAMS_COLLAPSED) === "1") runParamsCollapsed.value = true;
-  } catch (_) {}
   await loadMe();
   await loadCreditsOverview();
   await loadConfig();
@@ -2194,7 +2178,12 @@ onMounted(async () => {
       aria-live="polite"
     >
       <div
-        class="pointer-events-auto max-w-[min(90vw,24rem)] rounded-xl border border-zinc-600 bg-zinc-900/95 px-4 py-3 text-center text-sm text-zinc-100 shadow-xl backdrop-blur-sm"
+        class="pointer-events-auto max-w-[min(90vw,24rem)] rounded-xl border px-4 py-3 text-center text-sm shadow-xl backdrop-blur-sm"
+        :class="
+          toastVariant === 'error'
+            ? 'border-amber-500/70 bg-amber-950/95 text-amber-50'
+            : 'border-zinc-600 bg-zinc-900/95 text-zinc-100'
+        "
       >
         {{ toastMessage }}
       </div>
