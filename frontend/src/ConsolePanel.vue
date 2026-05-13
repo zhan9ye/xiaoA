@@ -1246,13 +1246,21 @@ async function toggleRun() {
         return;
       }
       if (!r.ok) {
+        let msg = "启动失败";
         try {
           const err = await r.json();
           const d = err.detail;
-          showToast(typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg || String(x)).join("；") : "启动失败");
+          if (typeof d === "string") msg = d;
+          else if (Array.isArray(d)) msg = d.map((x) => x.msg || String(x)).join("；");
         } catch {
-          showToast("启动失败");
+          /* ignore */
         }
+        const configMissing = msg.includes("填写不正确");
+        showToast(msg, {
+          variant: configMissing ? "error" : "info",
+          placement: configMissing ? "lower" : "default",
+          durationMs: configMissing ? 5000 : 3000,
+        });
         await refreshStatus();
         return;
       }

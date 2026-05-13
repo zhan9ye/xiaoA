@@ -121,6 +121,7 @@ from app.trading_config_repo import (
     persist_trading_config,
     set_active_trading_slot,
 )
+from app.trading_config_validation import trading_config_field_prompt, trading_config_start_block_reason
 from app.user_registry import (
     get_or_create_log_hub,
     get_or_create_state,
@@ -1144,7 +1145,7 @@ async def run_start(
 ) -> RunStatus:
     st = await get_or_create_state(user.id)
     if not await ensure_trading_config_loaded(db, user.id, st):
-        raise HTTPException(status_code=400, detail="请先保存配置")
+        raise HTTPException(status_code=400, detail=trading_config_field_prompt("交易端配置"))
     if st.runner_task is not None and not st.runner_task.done():
         fl = get_floor_controller(user.id)
         fm, sr429, nwin = fl.snapshot()
@@ -1162,8 +1163,9 @@ async def run_start(
         )
 
     cfg = st.config
-    if cfg is None:
-        raise HTTPException(status_code=400, detail="请先保存配置")
+    block_reason = trading_config_start_block_reason(cfg)
+    if block_reason:
+        raise HTTPException(status_code=400, detail=block_reason)
     await runner_execute_start_core(db, user.id, st)
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
