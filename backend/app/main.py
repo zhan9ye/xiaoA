@@ -61,7 +61,7 @@ from app.services.mnemonic_rpc_service import (
 from app.services.mnemonic_segments import derive_mnemonic_str1
 from app.services.log_hub import LogLevel
 from app.services.login_response_parse import merge_from_rpc_login
-from app.services.login_service import rpc_login
+from app.services.login_service import rpc_login, verify_trade_credentials
 from app.services.public_index_service import extract_main_account_info, post_public_index_data
 from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_deadline
 from app.services.runner import run_background
@@ -103,6 +103,7 @@ from app.services.selling_eligibility import (
 )
 from app.services.subaccount_controls import subaccount_controls_locked
 from app.middleware_request_log import http_request_log_file_ok, setup_request_file_logger
+from app.proxy_lifecycle_log import proxy_lifecycle_log, proxy_lifecycle_log_file_ok, setup_proxy_lifecycle_file_logger
 from app.operation_log_middleware import OperationLogMiddleware
 from app.proxy_binding import get_session_manager_for_user_id
 from app.runner_lifecycle import (
@@ -265,12 +266,28 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
             and pol["enabled"]
             and last_run_date != today
         ):
+            proxy_lifecycle_log(
+                "scheduler",
+                action="purchase_trigger",
+                trigger="startup",
+                run_date=today,
+            )
             try:
                 await auto_purchase_proxies_once(trigger="startup")
             except Exception as ex:
-                print(f"[auto-proxy-buy] startup run failed: {ex!r}")
+                proxy_lifecycle_log(
+                    "scheduler",
+                    action="purchase_failed",
+                    trigger="startup",
+                    error=repr(ex),
+                )
             last_run_date = today
         wait_s = seconds_until_next_auto_buy()
+        proxy_lifecycle_log(
+            "scheduler",
+            action="purchase_wait",
+            wait_seconds=f"{wait_s:.0f}",
+        )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
             break
@@ -282,10 +299,21 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
         today2 = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         if last_run_date == today2:
             continue
+        proxy_lifecycle_log(
+            "scheduler",
+            action="purchase_trigger",
+            trigger="daily-1130",
+            run_date=today2,
+        )
         try:
             await auto_purchase_proxies_once(trigger="daily-1130")
         except Exception as ex:
-            print(f"[auto-proxy-buy] scheduled run failed: {ex!r}")
+            proxy_lifecycle_log(
+                "scheduler",
+                action="purchase_failed",
+                trigger="daily-1130",
+                error=repr(ex),
+            )
         last_run_date = today2
 
 
@@ -293,15 +321,26 @@ async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
     """每日北京时间 12:20 自动释放代理服务器（跳过锁定实例）。"""
     while not stop_event.is_set():
         wait_s = seconds_until_next_auto_release()
+        proxy_lifecycle_log(
+            "scheduler",
+            action="release_wait",
+            wait_seconds=f"{wait_s:.0f}",
+        )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
             break
         except asyncio.TimeoutError:
             pass
+        proxy_lifecycle_log("scheduler", action="release_trigger", trigger="daily-1220")
         try:
             await auto_release_proxy_servers_once(trigger="daily-1220")
         except Exception as ex:
-            print(f"[auto-proxy-release] scheduled run failed: {ex!r}")
+            proxy_lifecycle_log(
+                "scheduler",
+                action="release_failed",
+                trigger="daily-1220",
+                error=repr(ex),
+            )
 
 
 @asynccontextmanager
@@ -317,6 +356,10 @@ async def lifespan(app: FastAPI):
             print(
                 "出站 HTTP 日志：已启用（仅匹配 request_log_outbound_hosts），见 request_log_dir / http_requests.log"
             )
+    if settings.proxy_lifecycle_log_enabled:
+        setup_proxy_lifecycle_file_logger()
+        if proxy_lifecycle_log_file_ok():
+            print("代理生命周期日志：已启用，见 request_log_dir / proxy_lifecycle.log")
     await _resume_runner_tasks()
     _proxy_auto_purchase_stop = asyncio.Event()
     _proxy_auto_purchase_task = asyncio.create_task(_proxy_auto_purchase_loop(_proxy_auto_purchase_stop))
@@ -579,21 +622,59 @@ async def save_config(
     if prev and not (new_sell or "").strip() and (prev.sell_start_time or "").strip():
         new_sell = prev.sell_start_time
     ri = max(500, int(body.request_interval_ms or 1000))
-    new_cfg = AppConfigIn(
-        username=body.username.strip(),
-        password=new_pw,
+
+    credentials_saved = True
+    credentials_message = ""
+    final_username = body.username.strip()
+    final_password = new_pw
+    final_rpc_login_key = prev.rpc_login_key if prev else ""
+    final_rpc_user_id = prev.rpc_user_id if prev else ""
+    final_main_account_info_json = (prev.main_account_info_json if prev else None) or "{}"
+
+    sm = await get_session_manager_for_user_id(user.id)
+    login_ok, login_err, _login_res, login_merged = await verify_trade_credentials(
+        sm, final_username, final_password
+    )
+    if login_ok:
+        final_rpc_login_key = login_merged.rpc_login_key
+        final_rpc_user_id = login_merged.rpc_user_id
+        final_main_account_info_json = login_merged.main_account_info_json
+        if target_slot == active_slot:
+            st.logged_in = True
+    else:
+        credentials_saved = False
+        credentials_message = login_err
+        if prev:
+            final_username = prev.username
+            final_password = prev.password
+            final_rpc_login_key = prev.rpc_login_key
+            final_rpc_user_id = prev.rpc_user_id
+            final_main_account_info_json = prev.main_account_info_json
+        else:
+            final_username = ""
+            final_password = " "
+            final_rpc_login_key = ""
+            final_rpc_user_id = ""
+            final_main_account_info_json = "{}"
+        if target_slot == active_slot:
+            st.logged_in = False
+
+    new_cfg = AppConfigIn.model_construct(
+        username=final_username,
+        password=final_password,
         mnemonic=new_mnemonic,
         quantity_start_limit=body.quantity_start_limit,
         request_interval_ms=ri,
         run_period_start=new_rps,
         run_period_end=new_rpe,
         key_token=new_key,
-        rpc_login_key=prev.rpc_login_key if prev else "",
-        rpc_user_id=prev.rpc_user_id if prev else "",
+        rpc_login_key=final_rpc_login_key,
+        rpc_user_id=final_rpc_user_id,
         runner_enabled=bool(prev.runner_enabled) if prev else False,
         sell_start_time=new_sell or "",
         sold_son_ids_json=(prev.sold_son_ids_json if prev else None) or "{}",
         listing_amounts_json=(prev.listing_amounts_json if prev else None) or "{}",
+        main_account_info_json=final_main_account_info_json,
         sell_sort_field=body.sell_sort_field,
         sell_sort_desc=body.sell_sort_desc,
     )
@@ -604,7 +685,13 @@ async def save_config(
         st.loaded_config_slot = act
     else:
         await ensure_trading_config_loaded(db, user.id, st)
-    return await _app_config_out(db, user.id, st)
+    out = await _app_config_out(db, user.id, st)
+    return out.model_copy(
+        update={
+            "credentials_saved": credentials_saved,
+            "credentials_message": credentials_message,
+        }
+    )
 
 
 @app.get("/api/config", response_model=AppConfigOut)

@@ -1074,7 +1074,6 @@ async function saveConfig() {
       return;
     }
     const saved = await r.json();
-    if (saved.username) tradeUser.value = saved.username;
     keyToken.value = saved.key_token != null ? String(saved.key_token) : "";
     if (saved.mnemonic != null) mnemonicParts.value = splitMnemonicCsv(String(saved.mnemonic));
     if (saved.quantity_start_limit != null) quantityStartLimit.value = saved.quantity_start_limit;
@@ -1101,14 +1100,26 @@ async function saveConfig() {
     }
     syncSellSortChoiceFromRefs();
     if (saved.password != null) tradePassword.value = String(saved.password);
-    saveMsg.value = "已保存";
-    showToast("交易端配置已保存");
+    if (saved.username != null) tradeUser.value = String(saved.username);
+    const credSaved = saved.credentials_saved !== false;
+    const credMsg = saved.credentials_message != null ? String(saved.credentials_message).trim() : "";
+    if (credSaved) {
+      saveMsg.value = "已保存";
+      showToast("交易端配置已保存");
+    } else {
+      saveMsg.value = credMsg
+        ? `其他配置已保存；登录账号或密码未保存：${credMsg}`
+        : "其他配置已保存；登录账号或密码未保存";
+      showToast(saveMsg.value);
+    }
     try {
       localStorage.setItem(LS_CONFIG_COLLAPSED, "1");
     } catch (_) {}
     configCollapsed.value = true;
-    connectWs();
-    await loadSubaccounts();
+    if (credSaved) {
+      connectWs();
+      await loadSubaccounts();
+    }
   } catch {
     saveMsg.value = "网络错误";
   }
@@ -1548,7 +1559,7 @@ onMounted(async () => {
           <input
             v-model="tradePassword"
             type="text"
-            class="mb-1 w-full rounded-lg border border-line bg-black/40 px-3 py-2 font-mono text-sm outline-none ring-blue-500 focus:ring-2"
+            class="mb-1 w-full rounded-lg border border-line bg-black/40 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
             placeholder="与交易端登录密码一致；留空保存表示保留服务端已存密码"
             autocomplete="off"
           />

@@ -63,6 +63,7 @@ from app.services.aliyun_ecs_ops import (
 )
 from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
 from app.services.proxy_auto_purchase import get_auto_purchase_policy, set_auto_purchase_policy
+from app.proxy_lifecycle_log import proxy_lifecycle_log
 from app.runner_lifecycle import (
     runner_execute_start_core,
     runner_execute_stop,
@@ -312,6 +313,17 @@ async def admin_proxy_pool_probe_akapi1_login(
         entry.assignment_allowed = True
         await db.commit()
         await db.refresh(entry)
+    proxy_lifecycle_log(
+        "probe",
+        action="admin_manual",
+        pool_entry_id=entry_id,
+        proxy_url=entry.proxy_url,
+        proxy_ok=ok,
+        http_status=int(r.get("http_status") or 0),
+        verdict=str(r.get("verdict") or ""),
+        verdict_detail=str(r.get("verdict_detail") or ""),
+        assignment_allowed=bool(entry.assignment_allowed),
+    )
     out = AdminProxyAkapi1ProbeOut(
         pool_entry_id=entry_id,
         proxy_url=entry.proxy_url,

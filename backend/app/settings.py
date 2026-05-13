@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     request_log_max_body: int = 262_144
     # 逗号分隔主机名；仅当 URL 主机等于或为其子域时记录（默认 akapi1.com → 含 www.akapi1.com）
     request_log_outbound_hosts: str = "akapi1.com"
+    # 代理自动购机/探测/释放生命周期日志（默认 backend/logs/proxy_lifecycle.log，目录同 REQUEST_LOG_DIR）
+    proxy_lifecycle_log_enabled: bool = True  # PROXY_LIFECYCLE_LOG_ENABLED
 
     # 代理池（表 proxy_pool_entries）非空时：用户首次出站 RPC 领取一条并固定绑定。
     # True：池已满无法分配时拒绝（503）；False：回退为不使用代理直连。

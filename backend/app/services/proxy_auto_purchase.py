@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AsyncSessionLocal
 from app.models import AdminEcsInstanceLock, ProxyPoolEntry, TradingConfig, User
+from app.proxy_lifecycle_log import proxy_lifecycle_log
 from app.services.aliyun_ecs_ops import (
     aliyun_ecs_run_configured,
     delete_instance_sync,
@@ -59,6 +60,75 @@ async def _effective_auto_purchase_policy() -> Tuple[bool, int]:
     return bool(p["enabled"]), max(1, int(p["multiplier"]))
 
 
+async def _eligible_runner_users(db: AsyncSession, now_utc: dt.datetime) -> List[Tuple[int, str]]:
+    r = await db.execute(
+        select(User.id, User.username)
+        .join(
+            TradingConfig,
+            (TradingConfig.user_id == User.id) & (TradingConfig.slot == User.active_trading_slot),
+        )
+        .where(
+            User.is_disabled.is_(False),
+            User.subscription_end_at.is_not(None),
+            User.subscription_end_at > now_utc,
+            TradingConfig.runner_enabled.is_(True),
+        )
+        .order_by(User.id.asc())
+    )
+    return [(int(uid), str(username or "")) for uid, username in r.all()]
+
+
+def _format_eligible_users(users: List[Tuple[int, str]]) -> str:
+    if not users:
+        return ""
+    return ";".join(f"{uid}:{name}" for uid, name in users)
+
+
+async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
+    assignable_pool = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(ProxyPoolEntry)
+                .where(
+                    ProxyPoolEntry.is_active.is_(True),
+                    ProxyPoolEntry.assignment_allowed.is_(True),
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    idle_assignable = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(ProxyPoolEntry)
+                .where(
+                    ProxyPoolEntry.is_active.is_(True),
+                    ProxyPoolEntry.assignment_allowed.is_(True),
+                    ProxyPoolEntry.assigned_user_id.is_(None),
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    active_total = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(ProxyPoolEntry)
+                .where(ProxyPoolEntry.is_active.is_(True))
+            )
+        ).scalar_one()
+        or 0
+    )
+    return {
+        "assignable_pool": assignable_pool,
+        "idle_assignable": idle_assignable,
+        "active_total": active_total,
+    }
+
+
 async def _insert_auto_purchase_pool_rows(
     db: AsyncSession, ids: List[str], ip_map: Dict[str, str]
 ) -> Tuple[List[int], int, int, int]:
@@ -107,12 +177,29 @@ async def _release_failed_pool_entries_after_probe(failed_pids: List[int]) -> No
         async with AsyncSessionLocal() as db:
             locked = await db.get(AdminEcsInstanceLock, iid) is not None
         if locked:
-            print(f"[auto-proxy-buy] probe_fail: ECS 已锁定，跳过 DeleteInstance {iid}")
+            proxy_lifecycle_log(
+                "probe",
+                action="release_skip_locked",
+                pool_entry_id=pid,
+                instance_id=iid,
+            )
             continue
         try:
             await asyncio.to_thread(delete_instance_sync, iid)
+            proxy_lifecycle_log(
+                "probe",
+                action="release_failed_instance",
+                pool_entry_id=pid,
+                instance_id=iid,
+            )
         except Exception as ex:
-            print(f"[auto-proxy-buy] probe_fail DeleteInstance {iid}: {ex!r}")
+            proxy_lifecycle_log(
+                "probe",
+                action="release_failed_instance_error",
+                pool_entry_id=pid,
+                instance_id=iid,
+                error=repr(ex),
+            )
 
 
 async def _probe_replace_until_all_ok(
@@ -134,7 +221,13 @@ async def _probe_replace_until_all_ok(
     while cur:
         rounds_done += 1
         if rounds_done > max_rounds:
-            print(f"[auto-proxy-buy] trigger={trigger} probe 已达最大轮数 {max_rounds}，仍为未放行：{cur}")
+            proxy_lifecycle_log(
+                "probe",
+                action="abort_max_rounds",
+                trigger=trigger,
+                max_rounds=max_rounds,
+                pending_pool_entry_ids=",".join(str(x) for x in cur),
+            )
             return {
                 "probe_rounds": rounds_done - 1,
                 "probe_replacements_total": replacements_total,
@@ -142,8 +235,13 @@ async def _probe_replace_until_all_ok(
                 "probe_aborted_max_rounds": True,
             }
 
-        print(
-            f"[auto-proxy-buy] trigger={trigger} 购机后等待 {delay:.0f}s 再探测（第 {rounds_done} 轮，共 {len(cur)} 台）"
+        proxy_lifecycle_log(
+            "probe",
+            action="wait_before_round",
+            trigger=trigger,
+            round=rounds_done,
+            pending_count=len(cur),
+            delay_seconds=f"{delay:.0f}",
         )
         await asyncio.sleep(delay)
 
@@ -157,7 +255,13 @@ async def _probe_replace_until_all_ok(
                         pairs.append((pid, u))
 
         if not pairs:
-            print(f"[auto-proxy-buy] trigger={trigger} 探测：池条目已不存在 active，结束 pending={cur}")
+            proxy_lifecycle_log(
+                "probe",
+                action="abort_missing_rows",
+                trigger=trigger,
+                round=rounds_done,
+                pending_pool_entry_ids=",".join(str(x) for x in cur),
+            )
             return {
                 "probe_rounds": rounds_done,
                 "probe_replacements_total": replacements_total,
@@ -172,12 +276,34 @@ async def _probe_replace_until_all_ok(
 
         passed: List[int] = []
         failed: List[int] = []
-        for (pid, _u), raw in zip(pairs, raw_results):
+        for (pid, url), raw in zip(pairs, raw_results):
             if isinstance(raw, Exception):
-                print(f"[auto-proxy-buy] 探测异常 pool_entry_id={pid}: {raw!r}")
+                proxy_lifecycle_log(
+                    "probe",
+                    action="result",
+                    trigger=trigger,
+                    round=rounds_done,
+                    pool_entry_id=pid,
+                    proxy_url=url,
+                    proxy_ok=False,
+                    error=repr(raw),
+                )
                 failed.append(pid)
                 continue
-            if raw.get("proxy_ok"):
+            ok = bool(raw.get("proxy_ok"))
+            proxy_lifecycle_log(
+                "probe",
+                action="result",
+                trigger=trigger,
+                round=rounds_done,
+                pool_entry_id=pid,
+                proxy_url=url,
+                proxy_ok=ok,
+                http_status=int(raw.get("http_status") or 0),
+                verdict=str(raw.get("verdict") or ""),
+                verdict_detail=str(raw.get("verdict_detail") or ""),
+            )
+            if ok:
                 passed.append(pid)
             else:
                 failed.append(pid)
@@ -190,8 +316,13 @@ async def _probe_replace_until_all_ok(
             await db.commit()
 
         if not failed:
-            print(
-                f"[auto-proxy-buy] trigger={trigger} 探测全部通过：rounds={rounds_done} verified={len(passed)}"
+            proxy_lifecycle_log(
+                "probe",
+                action="round_complete",
+                trigger=trigger,
+                round=rounds_done,
+                passed_count=len(passed),
+                failed_count=0,
             )
             return {
                 "probe_rounds": rounds_done,
@@ -200,15 +331,28 @@ async def _probe_replace_until_all_ok(
                 "probe_aborted_max_rounds": False,
             }
 
-        print(
-            f"[auto-proxy-buy] trigger={trigger} 第 {rounds_done} 轮：通过 {len(passed)}，失败 {len(failed)}，补购并重测"
+        proxy_lifecycle_log(
+            "probe",
+            action="round_complete",
+            trigger=trigger,
+            round=rounds_done,
+            passed_count=len(passed),
+            failed_count=len(failed),
+            failed_pool_entry_ids=",".join(str(x) for x in failed),
+            replace_count=len(failed),
         )
         await _release_failed_pool_entries_after_probe(failed)
         k = len(failed)
         try:
             new_ids, rep_rid, new_ip_map = await asyncio.to_thread(run_instances_then_poll_public_ips_sync, k)
         except Exception as ex:
-            print(f"[auto-proxy-buy] 补购 RunInstances 失败: {ex!r}")
+            proxy_lifecycle_log(
+                "probe",
+                action="replace_run_instances_failed",
+                trigger=trigger,
+                round=rounds_done,
+                error=repr(ex),
+            )
             return {
                 "probe_rounds": rounds_done,
                 "probe_replacements_total": replacements_total,
@@ -223,12 +367,24 @@ async def _probe_replace_until_all_ok(
             await db.commit()
 
         if len(cur2) < k:
-            print(
-                f"[auto-proxy-buy] 补购入池不完整 want={k} got_rows={len(cur2)} "
-                f"skipped_no_ip={skipped_ni} skipped_dup={skipped_d} rid={rep_rid}"
+            proxy_lifecycle_log(
+                "probe",
+                action="replace_pool_incomplete",
+                trigger=trigger,
+                round=rounds_done,
+                want=k,
+                got_rows=len(cur2),
+                skipped_no_ip=skipped_ni,
+                skipped_duplicate=skipped_d,
+                request_id=rep_rid,
             )
         if not cur2:
-            print("[auto-proxy-buy] 补购未产生可用池条目，停止探测流程")
+            proxy_lifecycle_log(
+                "probe",
+                action="abort_no_new_rows",
+                trigger=trigger,
+                round=rounds_done,
+            )
             return {
                 "probe_rounds": rounds_done,
                 "probe_replacements_total": replacements_total,
@@ -251,47 +407,51 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
     全部实例创建并联调公网入库后等待，再探测；失败则释放并循环补购至通过或超限。
     容量口径：仅计 is_active + assignment_allowed 条目。
     """
+    proxy_lifecycle_log("purchase", action="start", trigger=trigger)
     enabled_eff, multiplier = await _effective_auto_purchase_policy()
     if not enabled_eff:
+        proxy_lifecycle_log("purchase", action="skip", trigger=trigger, reason="policy_disabled")
         return {"eligible_users": 0, "multiplier": int(multiplier), "to_buy": 0}
     if not aliyun_ecs_run_configured():
+        proxy_lifecycle_log("purchase", action="skip", trigger=trigger, reason="aliyun_ecs_not_configured")
         return {"eligible_users": 0, "multiplier": int(multiplier), "to_buy": 0}
 
     now_utc = dt.datetime.now(dt.timezone.utc)
     pending: List[int] = []
 
     async with AsyncSessionLocal() as db:
-        eligible_q = (
-            select(func.count())
-            .select_from(User)
-            .join(
-                TradingConfig,
-                (TradingConfig.user_id == User.id) & (TradingConfig.slot == User.active_trading_slot),
-            )
-            .where(
-                User.is_disabled.is_(False),
-                User.subscription_end_at.is_not(None),
-                User.subscription_end_at > now_utc,
-                TradingConfig.runner_enabled.is_(True),
-            )
-        )
-        eligible_users = int((await db.execute(eligible_q)).scalar_one() or 0)
-        assignable_q = (
-            select(func.count())
-            .select_from(ProxyPoolEntry)
-            .where(
-                ProxyPoolEntry.is_active.is_(True),
-                ProxyPoolEntry.assignment_allowed.is_(True),
-            )
-        )
-        assignable_pool = int((await db.execute(assignable_q)).scalar_one() or 0)
+        eligible_users_list = await _eligible_runner_users(db, now_utc)
+        eligible_users = len(eligible_users_list)
+        pool_inv = await _pool_inventory_snapshot(db)
+        assignable_pool = int(pool_inv["assignable_pool"])
 
         target_total = eligible_users * multiplier
         to_buy = max(0, target_total - assignable_pool)
+        proxy_lifecycle_log(
+            "purchase",
+            action="capacity_check",
+            trigger=trigger,
+            enabled=enabled_eff,
+            multiplier=multiplier,
+            eligible_users=eligible_users,
+            eligible_users_detail=_format_eligible_users(eligible_users_list),
+            assignable_pool=assignable_pool,
+            idle_assignable=pool_inv["idle_assignable"],
+            active_total=pool_inv["active_total"],
+            target_total=target_total,
+            to_buy=to_buy,
+        )
         if to_buy <= 0:
-            print(
-                f"[auto-proxy-buy] trigger={trigger} eligible={eligible_users} multiplier={multiplier} "
-                f"assignable_pool={assignable_pool} target={target_total} to_buy=0"
+            proxy_lifecycle_log(
+                "purchase",
+                action="skip",
+                trigger=trigger,
+                reason="pool_sufficient",
+                eligible_users=eligible_users,
+                multiplier=multiplier,
+                assignable_pool=assignable_pool,
+                target_total=target_total,
+                to_buy=0,
             )
             return {
                 "eligible_users": eligible_users,
@@ -306,14 +466,30 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
                 "probe_replacements_total": 0,
             }
 
+        proxy_lifecycle_log(
+            "purchase",
+            action="run_instances_start",
+            trigger=trigger,
+            to_buy=to_buy,
+        )
         ids, req_id, ip_map = await asyncio.to_thread(run_instances_then_poll_public_ips_sync, to_buy)
         pending, added, skipped_no_ip, skipped_dup = await _insert_auto_purchase_pool_rows(db, ids, ip_map)
         await db.commit()
-        print(
-            f"[auto-proxy-buy] trigger={trigger} eligible={eligible_users} multiplier={multiplier} "
-            f"assignable_pool={assignable_pool} target={target_total} to_buy={to_buy} created={len(ids)} "
-            f"added_pending_probe={added} skipped_no_ip={skipped_no_ip} skipped_dup={skipped_dup} "
-            f"request_id={req_id}"
+        proxy_lifecycle_log(
+            "purchase",
+            action="run_instances_complete",
+            trigger=trigger,
+            eligible_users=eligible_users,
+            multiplier=multiplier,
+            assignable_pool=assignable_pool,
+            target_total=target_total,
+            to_buy=to_buy,
+            created_instances=len(ids),
+            instance_ids=",".join(ids),
+            added_pending_probe=added,
+            skipped_no_ip=skipped_no_ip,
+            skipped_duplicate=skipped_dup,
+            request_id=req_id,
         )
         snapshot = {
             "eligible_users": eligible_users,
@@ -329,6 +505,13 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
         }
 
     if pending:
+        proxy_lifecycle_log(
+            "purchase",
+            action="probe_begin",
+            trigger=trigger,
+            pending_pool_entry_ids=",".join(str(x) for x in pending),
+            pending_count=len(pending),
+        )
         probe_out = await _probe_replace_until_all_ok(pending, trigger=trigger)
     else:
         probe_out = {
@@ -338,9 +521,33 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
             "probe_aborted_max_rounds": False,
         }
         if to_buy > 0:
-            print(f"[auto-proxy-buy] trigger={trigger} warning: to_buy={to_buy} but no pool rows added, skip probe")
+            proxy_lifecycle_log(
+                "purchase",
+                action="probe_skipped",
+                trigger=trigger,
+                reason="no_pool_rows_added",
+                to_buy=to_buy,
+            )
 
     snapshot.update(probe_out)
+    proxy_lifecycle_log(
+        "purchase",
+        action="complete",
+        trigger=trigger,
+        eligible_users=snapshot.get("eligible_users"),
+        multiplier=snapshot.get("multiplier"),
+        assignable_pool=snapshot.get("assignable_pool"),
+        target_total=snapshot.get("target_total"),
+        to_buy=snapshot.get("to_buy"),
+        created_instances=snapshot.get("created_instances", 0),
+        added=snapshot.get("added", 0),
+        skipped_no_ip=snapshot.get("skipped_no_ip", 0),
+        skipped_duplicate=snapshot.get("skipped_duplicate", 0),
+        request_id=snapshot.get("request_id", ""),
+        probe_rounds=snapshot.get("probe_rounds", 0),
+        probe_replacements_total=snapshot.get("probe_replacements_total", 0),
+        pending_unverified=",".join(str(x) for x in (snapshot.get("pending_unverified") or [])),
+    )
     return snapshot
 
 
@@ -349,9 +556,12 @@ async def auto_release_proxy_servers_once(trigger: str = "daily-1220") -> Dict[s
     每日释放代理服务器（跳过锁定实例），并清理对应代理池条目。
     规则：遍历当前地域 ECS，遇到未锁定实例即调用 DeleteInstance(force)。
     """
+    proxy_lifecycle_log("release", action="start", trigger=trigger)
     if not bool(settings.proxy_auto_release_enabled):
+        proxy_lifecycle_log("release", action="skip", trigger=trigger, reason="policy_disabled")
         return {"total": 0, "locked": 0, "released": 0}
     if not aliyun_ecs_run_configured():
+        proxy_lifecycle_log("release", action="skip", trigger=trigger, reason="aliyun_ecs_not_configured")
         return {"total": 0, "locked": 0, "released": 0}
 
     all_rows: List[Dict[str, str]] = []
@@ -380,6 +590,13 @@ async def auto_release_proxy_servers_once(trigger: str = "daily-1220") -> Dict[s
         if not iid:
             continue
         if iid in locked:
+            proxy_lifecycle_log(
+                "release",
+                action="skip_locked",
+                trigger=trigger,
+                instance_id=iid,
+                public_ip=str(row.get("public_ip") or "").strip(),
+            )
             continue
         public_ip = (row.get("public_ip") or "").strip()
         async with AsyncSessionLocal() as db:
@@ -396,12 +613,32 @@ async def auto_release_proxy_servers_once(trigger: str = "daily-1220") -> Dict[s
         try:
             await asyncio.to_thread(delete_instance_sync, iid)
             released += 1
+            proxy_lifecycle_log(
+                "release",
+                action="released",
+                trigger=trigger,
+                instance_id=iid,
+                public_ip=public_ip,
+                removed_pool_entries=len(entries),
+            )
         except Exception as ex:
-            print(f"[auto-proxy-release] delete failed iid={iid}: {ex!r}")
+            proxy_lifecycle_log(
+                "release",
+                action="delete_failed",
+                trigger=trigger,
+                instance_id=iid,
+                public_ip=public_ip,
+                error=repr(ex),
+            )
 
-    print(
-        f"[auto-proxy-release] trigger={trigger} total={len(all_rows)} locked={len(locked)} "
-        f"released={released} removed_pool_entries={removed_pool_entries}"
+    proxy_lifecycle_log(
+        "release",
+        action="complete",
+        trigger=trigger,
+        total=len(all_rows),
+        locked=len(locked),
+        released=released,
+        removed_pool_entries=removed_pool_entries,
     )
     return {
         "total": len(all_rows),

@@ -227,6 +227,14 @@ class AppConfigOut(BaseModel):
         default_factory=list,
         description="各槽是否已保存、槽内交易用户名等简报",
     )
+    credentials_saved: bool = Field(
+        default=True,
+        description="本次保存是否已写入登录账号与密码；false 表示仅其他配置已保存",
+    )
+    credentials_message: str = Field(
+        default="",
+        description="登录校验失败时的说明；成功时为空",
+    )
 
 
 class ListingAmountPatchIn(BaseModel):
