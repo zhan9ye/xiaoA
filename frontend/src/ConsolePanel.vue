@@ -14,56 +14,13 @@ const MNEMONIC_SEGMENTS = 12;
 const mnemonicParts = ref(Array.from({ length: MNEMONIC_SEGMENTS }, () => ""));
 const quantityStartLimit = ref(1000);
 const requestIntervalMs = ref(1000);
-/** 北京时间开售 HH:mm（由下拉框同步）；默认 12:00 */
+/** 全站开售北京时间 HH:mm（只读，由管理端配置） */
 const sellStartTime = ref("12:00");
-/** 下拉：空字符串表示不指定（立即开售）；否则 '00'–'23' */
-const sellHourSel = ref("12");
-/** 下拉：'00'–'59' */
-const sellMinuteSel = ref("00");
-
-const SELL_HOUR_OPTS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, "0"));
-const SELL_MINUTE_OPTS = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, "0"));
-
-/** 上次已成功落库的开售时间（与 sellStartTime 同格式），用于「保存时间」按钮状态 */
-const sellTimeCommitted = ref("");
-
-function normalizeSellStart(s) {
-  return (s || "").trim();
-}
-
-/** 当前选择与已保存值不一致 → 可点击「保存时间」 */
-const sellTimeIsDirty = computed(
-  () => normalizeSellStart(sellStartTime.value) !== normalizeSellStart(sellTimeCommitted.value),
-);
 
 function applySellStartFromApi(raw) {
   const t = (raw || "").trim();
-  if (!t) {
-    sellHourSel.value = "";
-    sellMinuteSel.value = "00";
-    sellStartTime.value = "";
-    sellTimeCommitted.value = "";
-    return;
-  }
-  const m = t.match(/^(\d{1,2}):(\d{2})$/);
-  if (m) {
-    const hh = String(Number(m[1])).padStart(2, "0");
-    const mm = String(Number(m[2])).padStart(2, "0");
-    sellHourSel.value = hh;
-    sellMinuteSel.value = mm;
-    sellStartTime.value = `${hh}:${mm}`;
-  }
-  sellTimeCommitted.value = normalizeSellStart(sellStartTime.value);
+  sellStartTime.value = t || "—";
 }
-
-watch([sellHourSel, sellMinuteSel], () => {
-  if (!sellHourSel.value) {
-    sellStartTime.value = "";
-    return;
-  }
-  const mm = sellMinuteSel.value || "00";
-  sellStartTime.value = `${sellHourSel.value}:${mm}`;
-});
 const runPeriodStart = ref("");
 const runPeriodEnd = ref("");
 /** 来自 /api/run/status：SR₄₂₉ 窗口 */
@@ -1054,7 +1011,6 @@ async function saveConfig() {
     request_interval_ms: Math.max(1000, Number(requestIntervalMs.value) || 1000),
     run_period_start: runPeriodStart.value || "",
     run_period_end: runPeriodEnd.value || "",
-    sell_start_time: sellStartTime.value.trim(),
     sell_sort_field: sellSortField.value,
     sell_sort_desc: !!sellSortDesc.value,
   };
@@ -1087,11 +1043,7 @@ async function saveConfig() {
     if (saved.request_interval_ms != null) requestIntervalMs.value = saved.request_interval_ms;
     if (saved.run_period_start != null) runPeriodStart.value = saved.run_period_start || "";
     if (saved.run_period_end != null) runPeriodEnd.value = saved.run_period_end || "";
-    if (saved.sell_start_time != null) {
-      applySellStartFromApi(saved.sell_start_time);
-    } else {
-      sellTimeCommitted.value = normalizeSellStart(sellStartTime.value);
-    }
+    if (saved.sell_start_time != null) applySellStartFromApi(saved.sell_start_time);
     if (saved.listing_amounts && typeof saved.listing_amounts === "object") {
       listingAmountsMap.value = { ...saved.listing_amounts };
     }
@@ -1137,7 +1089,6 @@ async function saveRunParams(successToast = "") {
     request_interval_ms: Math.max(1000, Number(requestIntervalMs.value) || 1000),
     run_period_start: runPeriodStart.value || "",
     run_period_end: runPeriodEnd.value || "",
-    sell_start_time: sellStartTime.value.trim(),
     sell_sort_field: sellSortField.value,
     sell_sort_desc: !!sellSortDesc.value,
   };
@@ -1169,11 +1120,7 @@ async function saveRunParams(successToast = "") {
     if (saved.request_interval_ms != null) requestIntervalMs.value = saved.request_interval_ms;
     if (saved.run_period_start != null) runPeriodStart.value = saved.run_period_start || "";
     if (saved.run_period_end != null) runPeriodEnd.value = saved.run_period_end || "";
-    if (saved.sell_start_time != null) {
-      applySellStartFromApi(saved.sell_start_time);
-    } else {
-      sellTimeCommitted.value = normalizeSellStart(sellStartTime.value);
-    }
+    if (saved.sell_start_time != null) applySellStartFromApi(saved.sell_start_time);
     if (saved.sell_sort_field === "create_time" || saved.sell_sort_field === "ace_amount") {
       sellSortField.value = saved.sell_sort_field;
     }
@@ -1256,10 +1203,12 @@ async function toggleRun() {
           /* ignore */
         }
         const configMissing = msg.includes("填写不正确");
+        const runStartBlocked = msg.includes("当前时间不允许开启售卖任务");
+        const useErrorToast = configMissing || runStartBlocked;
         showToast(msg, {
-          variant: configMissing ? "error" : "info",
-          placement: configMissing ? "lower" : "default",
-          durationMs: configMissing ? 5000 : 3000,
+          variant: useErrorToast ? "error" : "info",
+          placement: useErrorToast ? "lower" : "default",
+          durationMs: useErrorToast ? 5000 : 3000,
         });
         await refreshStatus();
         return;
@@ -1712,41 +1661,7 @@ onMounted(async () => {
               </template>
             </div>
 
-            <div class="space-y-2">
-              <label class="text-xs font-medium text-zinc-400">开售时间（北京时间）</label>
-              <div class="flex flex-wrap items-center gap-2">
-                <div class="flex max-w-[14rem] flex-1 flex-wrap items-center gap-2 sm:flex-initial">
-                  <select
-                    v-model="sellHourSel"
-                    class="min-w-0 flex-1 basis-0 rounded-lg border border-line bg-black/40 px-2 py-2 font-mono text-sm text-zinc-200 outline-none ring-blue-500 focus:ring-2"
-                  >
-                    <option value="">不指定（立即开售）</option>
-                    <option v-for="h in SELL_HOUR_OPTS" :key="h" :value="h">{{ h }} 时</option>
-                  </select>
-                  <span class="shrink-0 text-zinc-500">:</span>
-                  <select
-                    v-model="sellMinuteSel"
-                    :disabled="!sellHourSel"
-                    class="min-w-0 flex-1 basis-0 rounded-lg border border-line bg-black/40 px-2 py-2 font-mono text-sm text-zinc-200 outline-none ring-blue-500 focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <option v-for="m in SELL_MINUTE_OPTS" :key="m" :value="m">{{ m }} 分</option>
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  class="min-h-[2.5rem] rounded-lg border px-4 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                  :class="
-                    sellTimeIsDirty
-                      ? 'border-zinc-600 bg-zinc-800/80 text-zinc-200 hover:bg-zinc-700'
-                      : 'border-zinc-700/80 bg-zinc-900/60 text-zinc-500'
-                  "
-                  :disabled="!sellTimeIsDirty"
-                  @click="saveRunParams('开售时间已保存')"
-                >
-                  {{ sellTimeIsDirty ? "保存时间" : "已保存" }}
-                </button>
-              </div>
-            </div>
+            <p class="text-xs text-zinc-400">开售时间（北京时间）：{{ sellStartTime }}</p>
           </div>
         </section>
 

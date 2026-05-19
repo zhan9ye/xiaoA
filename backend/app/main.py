@@ -63,6 +63,8 @@ from app.services.log_hub import LogLevel
 from app.services.login_response_parse import merge_from_rpc_login
 from app.services.login_service import rpc_login, verify_trade_credentials
 from app.services.public_index_service import extract_main_account_info, post_public_index_data
+from app.platform_settings_repo import get_platform_sell_start_time
+from app.sell_start_gate import run_start_block_reason
 from app.services.beijing_time import beijing_today_str, timed_sell_past_grace_deadline
 from app.services.runner import run_background
 from app.services.proxy_auto_purchase import (
@@ -71,6 +73,7 @@ from app.services.proxy_auto_purchase import (
     get_auto_purchase_policy,
     seconds_until_next_auto_buy,
     seconds_until_next_auto_release,
+    seconds_until_next_pre_sell_purchase,
 )
 from app.services.subaccount_service import FetchSubaccountsOutcome, fetch_all_subaccounts
 from app.services.totp_util import totp_now_from_secret_ex
@@ -139,15 +142,15 @@ def _trading_password_for_api(pw: str) -> str:
     return pw
 
 
-def _run_status_timed_sell_flags(st) -> Tuple[bool, bool]:
+def _run_status_timed_sell_flags(st, sell_hhmm: str) -> Tuple[bool, bool]:
     """(timed_sell_internal_only_today, timed_sell_would_skip_outbound_if_started)。"""
     today = beijing_today_str()
     running = st.runner_task is not None and not st.runner_task.done()
     internal_only = running and (st.runner_late_start_skip_outbound_today or "").strip() == today
     would_skip = False
-    if not running and st.config and (st.config.sell_start_time or "").strip():
+    if not running and (sell_hhmm or "").strip():
         g = max(0, int(settings.sell_start_missed_grace_minutes or 10))
-        would_skip = timed_sell_past_grace_deadline(st.config.sell_start_time, g)
+        would_skip = timed_sell_past_grace_deadline(sell_hhmm, g)
     return internal_only, would_skip
 
 
@@ -171,6 +174,7 @@ async def _app_config_out(db: AsyncSession, user_id: int, st) -> AppConfigOut:
     act = await get_active_trading_slot(db, user_id)
     slots_raw = await list_trading_slot_briefs(db, user_id)
     slots_out = [TradingSlotBrief(**s) for s in slots_raw]
+    platform_sell = await get_platform_sell_start_time(db)
     await ensure_trading_config_loaded(db, user_id, st)
     if st.config is None:
         return AppConfigOut(
@@ -182,7 +186,7 @@ async def _app_config_out(db: AsyncSession, user_id: int, st) -> AppConfigOut:
             request_interval_ms=1000,
             run_period_start="",
             run_period_end="",
-            sell_start_time="",
+            sell_start_time=platform_sell,
             sell_sort_field="create_time",
             sell_sort_desc=False,
             listing_amounts={},
@@ -199,7 +203,7 @@ async def _app_config_out(db: AsyncSession, user_id: int, st) -> AppConfigOut:
         request_interval_ms=c.request_interval_ms,
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
-        sell_start_time=c.sell_start_time or "",
+        sell_start_time=platform_sell,
         sell_sort_field=c.sell_sort_field,
         sell_sort_desc=c.sell_sort_desc,
         listing_amounts=listing_amounts_for_api(c),
@@ -242,12 +246,16 @@ async def _resume_runner_tasks() -> None:
         st.loaded_config_slot = act_slot
         st.stop_event = asyncio.Event()
         st.runner_must_refresh_trading_cache = True
-        apply_timed_sell_late_start_skip_flag(st, cfg)
+        async with AsyncSessionLocal() as session:
+            sell_hhmm = await get_platform_sell_start_time(session)
+        apply_timed_sell_late_start_skip_flag(st, sell_hhmm)
         st.runner_task = asyncio.create_task(run_background(uid, cfg))
 
 
 _proxy_auto_purchase_task: Optional[asyncio.Task] = None
 _proxy_auto_purchase_stop: Optional[asyncio.Event] = None
+_proxy_pre_sell_purchase_task: Optional[asyncio.Task] = None
+_proxy_pre_sell_purchase_stop: Optional[asyncio.Event] = None
 _proxy_auto_release_task: Optional[asyncio.Task] = None
 _proxy_auto_release_stop: Optional[asyncio.Event] = None
 
@@ -318,6 +326,49 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
         last_run_date = today2
 
 
+async def _proxy_pre_sell_purchase_loop(stop_event: asyncio.Event) -> None:
+    """每日全站开售北京时间前 10 分钟补购（含探测与批量 Login）。"""
+    last_run_date = ""
+    while not stop_event.is_set():
+        async with AsyncSessionLocal() as db:
+            sell_hhmm = await get_platform_sell_start_time(db)
+        wait_s = seconds_until_next_pre_sell_purchase(sell_hhmm)
+        proxy_lifecycle_log(
+            "scheduler",
+            action="pre_sell_purchase_wait",
+            wait_seconds=f"{wait_s:.0f}",
+            sell_start_time=sell_hhmm,
+        )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+            break
+        except asyncio.TimeoutError:
+            pass
+        pol = await get_auto_purchase_policy()
+        if not pol["enabled"]:
+            continue
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        if last_run_date == today:
+            continue
+        proxy_lifecycle_log(
+            "scheduler",
+            action="purchase_trigger",
+            trigger="pre-sell-10m",
+            run_date=today,
+            sell_start_time=sell_hhmm,
+        )
+        try:
+            await auto_purchase_proxies_once(trigger="pre-sell-10m")
+        except Exception as ex:
+            proxy_lifecycle_log(
+                "scheduler",
+                action="purchase_failed",
+                trigger="pre-sell-10m",
+                error=repr(ex),
+            )
+        last_run_date = today
+
+
 async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
     """每日北京时间 12:20 自动释放代理服务器（跳过锁定实例）。"""
     while not stop_event.is_set():
@@ -347,6 +398,7 @@ async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _proxy_auto_purchase_task, _proxy_auto_purchase_stop
+    global _proxy_pre_sell_purchase_task, _proxy_pre_sell_purchase_stop
     global _proxy_auto_release_task, _proxy_auto_release_stop
     await init_db()
     if settings.jwt_secret == "dev-change-me":
@@ -364,6 +416,10 @@ async def lifespan(app: FastAPI):
     await _resume_runner_tasks()
     _proxy_auto_purchase_stop = asyncio.Event()
     _proxy_auto_purchase_task = asyncio.create_task(_proxy_auto_purchase_loop(_proxy_auto_purchase_stop))
+    _proxy_pre_sell_purchase_stop = asyncio.Event()
+    _proxy_pre_sell_purchase_task = asyncio.create_task(
+        _proxy_pre_sell_purchase_loop(_proxy_pre_sell_purchase_stop)
+    )
     _proxy_auto_release_stop = asyncio.Event()
     _proxy_auto_release_task = asyncio.create_task(_proxy_auto_release_loop(_proxy_auto_release_stop))
     yield
@@ -379,6 +435,18 @@ async def lifespan(app: FastAPI):
             pass
         _proxy_auto_purchase_task = None
         _proxy_auto_purchase_stop = None
+    if _proxy_pre_sell_purchase_stop is not None:
+        _proxy_pre_sell_purchase_stop.set()
+    if _proxy_pre_sell_purchase_task is not None:
+        _proxy_pre_sell_purchase_task.cancel()
+        try:
+            await _proxy_pre_sell_purchase_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        _proxy_pre_sell_purchase_task = None
+        _proxy_pre_sell_purchase_stop = None
     if _proxy_auto_release_stop is not None:
         _proxy_auto_release_stop.set()
     if _proxy_auto_release_task is not None:
@@ -619,9 +687,6 @@ async def save_config(
             new_rps = prev.run_period_start
         if new_rpe == "" and prev.run_period_end:
             new_rpe = prev.run_period_end
-    new_sell = body.sell_start_time
-    if prev and not (new_sell or "").strip() and (prev.sell_start_time or "").strip():
-        new_sell = prev.sell_start_time
     ri = max(500, int(body.request_interval_ms or 1000))
 
     credentials_saved = True
@@ -672,7 +737,7 @@ async def save_config(
         rpc_login_key=final_rpc_login_key,
         rpc_user_id=final_rpc_user_id,
         runner_enabled=bool(prev.runner_enabled) if prev else False,
-        sell_start_time=new_sell or "",
+        sell_start_time="",
         sold_son_ids_json=(prev.sold_son_ids_json if prev else None) or "{}",
         listing_amounts_json=(prev.listing_amounts_json if prev else None) or "{}",
         main_account_info_json=final_main_account_info_json,
@@ -787,6 +852,7 @@ async def patch_listing_amount(
 @app.get("/api/config/run-params", response_model=RunParamsOut)
 async def get_run_params(user: User = Depends(require_active_subscription), db: AsyncSession = Depends(get_db)):
     """从数据库读取运行参数（明文列，无需解密）；无记录时返回与前端一致的默认。"""
+    platform_sell = await get_platform_sell_start_time(db)
     slot_rp = await get_active_trading_slot(db, user.id)
     row = await db.get(TradingConfig, (user.id, slot_rp))
     if row is None:
@@ -795,7 +861,7 @@ async def get_run_params(user: User = Depends(require_active_subscription), db: 
             request_interval_ms=1000,
             run_period_start="",
             run_period_end="",
-            sell_start_time="12:00",
+            sell_start_time=platform_sell,
             sell_sort_field="create_time",
             sell_sort_desc=False,
         )
@@ -810,7 +876,7 @@ async def get_run_params(user: User = Depends(require_active_subscription), db: 
         request_interval_ms=ri,
         run_period_start=row.run_period_start or "",
         run_period_end=row.run_period_end or "",
-        sell_start_time=(getattr(row, "sell_start_time", None) or "") or "",
+        sell_start_time=platform_sell,
         sell_sort_field=ssf,
         sell_sort_desc=bool(getattr(row, "sell_sort_desc", False)),
     )
@@ -841,7 +907,6 @@ async def patch_run_params(
             "request_interval_ms": max(500, int(body.request_interval_ms or 1000)),
             "run_period_start": body.run_period_start,
             "run_period_end": body.run_period_end,
-            "sell_start_time": body.sell_start_time or "",
             "sell_sort_field": new_sf,
             "sell_sort_desc": new_sd,
         }
@@ -849,12 +914,13 @@ async def patch_run_params(
     slot_a = await get_active_trading_slot(db, user.id)
     await persist_trading_config(db, user.id, slot_a, st.config)
     c = st.config
+    platform_sell = await get_platform_sell_start_time(db)
     return RunParamsOut(
         quantity_start_limit=c.quantity_start_limit,
         request_interval_ms=c.request_interval_ms,
         run_period_start=c.run_period_start,
         run_period_end=c.run_period_end,
-        sell_start_time=c.sell_start_time or "",
+        sell_start_time=platform_sell,
         sell_sort_field=c.sell_sort_field,
         sell_sort_desc=c.sell_sort_desc,
     )
@@ -1124,7 +1190,8 @@ async def run_status(user: User = Depends(require_active_subscription), db: Asyn
     fl = get_floor_controller(user.id)
     floor_ms, sr429, nwin = fl.snapshot()
     enabled = bool(st.config.runner_enabled) if st.config else False
-    tio, tws = _run_status_timed_sell_flags(st)
+    platform_sell = await get_platform_sell_start_time(db)
+    tio, tws = _run_status_timed_sell_flags(st, platform_sell)
     return RunStatus(
         running=running,
         last_error=st.last_runner_error,
@@ -1149,7 +1216,8 @@ async def run_start(
     if st.runner_task is not None and not st.runner_task.done():
         fl = get_floor_controller(user.id)
         fm, sr429, nwin = fl.snapshot()
-        tio, tws = _run_status_timed_sell_flags(st)
+        platform_sell = await get_platform_sell_start_time(db)
+        tio, tws = _run_status_timed_sell_flags(st, platform_sell)
         return RunStatus(
             running=True,
             last_error=st.last_runner_error,
@@ -1166,10 +1234,14 @@ async def run_start(
     block_reason = trading_config_start_block_reason(cfg)
     if block_reason:
         raise HTTPException(status_code=400, detail=block_reason)
+    platform_sell = await get_platform_sell_start_time(db)
+    proxy_block = await run_start_block_reason(db, user.id, platform_sell)
+    if proxy_block:
+        raise HTTPException(status_code=400, detail=proxy_block)
     await runner_execute_start_core(db, user.id, st)
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
-    tio, tws = _run_status_timed_sell_flags(st)
+    tio, tws = _run_status_timed_sell_flags(st, platform_sell)
     return RunStatus(
         running=True,
         last_error=None,
@@ -1188,7 +1260,8 @@ async def run_stop(user: User = Depends(require_active_subscription), db: AsyncS
     st = await runner_execute_stop(db, user.id)
     fl = get_floor_controller(user.id)
     fm, sr429, nwin = fl.snapshot()
-    tio, tws = _run_status_timed_sell_flags(st)
+    platform_sell = await get_platform_sell_start_time(db)
+    tio, tws = _run_status_timed_sell_flags(st, platform_sell)
     return RunStatus(
         running=False,
         last_error=st.last_runner_error,

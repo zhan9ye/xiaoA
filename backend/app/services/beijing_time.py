@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app.settings import settings
@@ -92,31 +92,39 @@ async def wait_interruptible_until_beijing(
     deadline: dt.datetime,
     *,
     max_chunk_seconds: float = 0.25,
-) -> None:
+    should_resync: Optional[Callable[[], bool]] = None,
+) -> bool:
     """
     墙钟对齐：睡到北京时间 >= deadline（分段 wait，避免单次长 sleep 与系统时间调整叠加后偏差过大）。
+    返回 True 表示已到达 deadline；False 表示 stop 或 should_resync 为真。
     """
     if deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=BJ)
     while not stop_event.is_set():
+        if should_resync is not None and should_resync():
+            return False
         now = beijing_now()
         if now >= deadline:
-            return
+            return True
         rem = (deadline - now).total_seconds()
         chunk = min(max(rem, 0.0), max_chunk_seconds)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=chunk)
         except asyncio.TimeoutError:
             pass
+    return False
 
 
 async def wait_open_phases_beijing(
     stop_event: asyncio.Event,
     start_dt: dt.datetime,
     wake_early_ms: int,
-) -> None:
+    *,
+    should_resync: Optional[Callable[[], bool]] = None,
+) -> bool:
     """
     WaitOpen：先睡到 T_open - wake_early_ms（最后组装），再睡到 T_open 整点。
+    返回 True 表示已到达开售整点；False 表示 stop 或全站开售时间变更需重算。
     """
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=BJ)
@@ -124,6 +132,12 @@ async def wait_open_phases_beijing(
     if w > 0:
         early = start_dt - dt.timedelta(milliseconds=w)
         if beijing_now() < early:
-            await wait_interruptible_until_beijing(stop_event, early)
+            if not await wait_interruptible_until_beijing(
+                stop_event, early, should_resync=should_resync
+            ):
+                return False
     if beijing_now() < start_dt:
-        await wait_interruptible_until_beijing(stop_event, start_dt)
+        return await wait_interruptible_until_beijing(
+            stop_event, start_dt, should_resync=should_resync
+        )
+    return True

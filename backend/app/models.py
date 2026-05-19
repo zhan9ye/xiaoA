@@ -119,6 +119,15 @@ class TradingConfig(Base):
     sell_sort_desc: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class PlatformSettings(Base):
+    """全站业务配置（单例行 id=1）；开售时间等由管理端热更新。"""
+
+    __tablename__ = "platform_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sell_start_time: Mapped[str] = mapped_column(String(8), default="12:00")
+
+
 class UserOperationLog(Base):
     """控制台用户（及管理员 JWT）对 API 的操作留痕；params_json 为脱敏后的 JSON 字符串。"""
 

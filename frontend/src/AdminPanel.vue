@@ -39,6 +39,8 @@ const proxyAutoPurchasePolicy = ref({
   default_multiplier: 1,
 });
 const proxyAutoPurchaseBusy = ref(false);
+const platformSellStartTime = ref("12:00");
+const platformSellStartBusy = ref(false);
 
 /** 阿里云 ECS：按启动模板创建（测试） */
 const ecsTestAmount = ref(1);
@@ -198,10 +200,56 @@ async function saveProxyAutoPurchasePolicy() {
   }
 }
 
+async function loadPlatformSellStart() {
+  if (!token.value) return;
+  try {
+    const r = await fetch("/api/admin/platform-sell-start", { headers: headers() });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) return;
+    const j = await r.json();
+    platformSellStartTime.value = (j.sell_start_time || "12:00").trim() || "12:00";
+  } catch {
+    /* ignore */
+  }
+}
+
+async function savePlatformSellStart() {
+  actionMsg.value = "";
+  platformSellStartBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/platform-sell-start", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify({ sell_start_time: platformSellStartTime.value.trim() }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "保存全站开售时间失败";
+      return;
+    }
+    platformSellStartTime.value = (j.sell_start_time || "12:00").trim() || "12:00";
+    actionMsg.value = `已保存全站开售时间：${platformSellStartTime.value}`;
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    platformSellStartBusy.value = false;
+  }
+}
+
 async function refreshAll() {
   await Promise.all([
     loadImpersonatePolicy(),
     loadMultiProxyPolicy(),
+    loadPlatformSellStart(),
     loadProxyAutoPurchasePolicy(),
     loadUsers(),
     loadProxyPool(),
@@ -1014,6 +1062,30 @@ onMounted(() => {
         <p v-if="actionMsg" class="mb-2 text-xs text-emerald-400/90">{{ actionMsg }}</p>
 
         <h2 class="mb-2 text-sm font-medium text-zinc-300">出站代理池</h2>
+        <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+          <p class="mb-2 text-xs text-zinc-500">
+            全站开售时间（北京时间）：购机、Runner 定时开售与开售前禁开窗均读取此配置，热更新无需重启。
+          </p>
+          <div class="flex flex-wrap items-center gap-3">
+            <label class="inline-flex items-center gap-2 text-xs text-zinc-400">
+              <span class="shrink-0">开售</span>
+              <input
+                v-model="platformSellStartTime"
+                type="time"
+                step="60"
+                class="rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs leading-none"
+              />
+            </label>
+            <button
+              type="button"
+              class="inline-flex shrink-0 items-center justify-center rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs leading-none text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
+              :disabled="platformSellStartBusy"
+              @click="savePlatformSellStart"
+            >
+              {{ platformSellStartBusy ? "保存中…" : "保存开售时间" }}
+            </button>
+          </div>
+        </div>
         <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
           <p class="mb-2 text-xs text-zinc-500">
             自动购机策略（每日北京时间 11:30）：按「有效订阅且运行开启用户数 × 倍数」补足代理池。

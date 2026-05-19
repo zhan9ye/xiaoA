@@ -16,16 +16,16 @@ from app.trading_config_repo import ensure_trading_config_loaded, get_active_tra
 from app.user_registry import get_or_create_state
 
 
-def apply_timed_sell_late_start_skip_flag(st: AppState, cfg: Optional[AppConfigIn]) -> None:
+def apply_timed_sell_late_start_skip_flag(st: AppState, sell_hhmm: str) -> None:
     """
-    配置了 sell_start_time 且当前已超过「开售整点 + sell_start_missed_grace_minutes」时，
+    配置了全站开售时刻且当前已超过「开售整点 + sell_start_missed_grace_minutes」时，
     标记本北京日仅内部等待，runner 不调登录/子账号/助记词/售卖等对外接口。
     """
-    if cfg is None or not (cfg.sell_start_time or "").strip():
+    if not (sell_hhmm or "").strip():
         st.runner_late_start_skip_outbound_today = ""
         return
     g = max(0, int(settings.sell_start_missed_grace_minutes or 10))
-    if timed_sell_past_grace_deadline(cfg.sell_start_time, g):
+    if timed_sell_past_grace_deadline(sell_hhmm, g):
         st.runner_late_start_skip_outbound_today = beijing_today_str()
     else:
         st.runner_late_start_skip_outbound_today = ""
@@ -69,7 +69,10 @@ async def runner_execute_start_core(db: AsyncSession, user_id: int, st: AppState
     st.stop_event = asyncio.Event()
     st.runner_must_refresh_trading_cache = True
     st.hot_sell_window_active = False
-    apply_timed_sell_late_start_skip_flag(st, st.config)
+    from app.platform_settings_repo import get_platform_sell_start_time
+
+    sell_hhmm = await get_platform_sell_start_time(db)
+    apply_timed_sell_late_start_skip_flag(st, sell_hhmm)
     st.runner_task = asyncio.create_task(run_background(user_id, st.config))
 
 

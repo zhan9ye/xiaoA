@@ -16,9 +16,12 @@ from app.services.aliyun_ecs_ops import (
     list_ecs_instances_page_sync,
     run_instances_then_poll_public_ips_sync,
 )
+from app.services.beijing_time import BJ, beijing_now, parse_hhmm
+from app.services.login_service import verify_trade_credentials
 from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
-from app.services.beijing_time import BJ, beijing_now
 from app.settings import settings
+from app.trading_config_repo import get_active_trading_slot, load_trading_config, persist_trading_config
+from app.user_registry import get_or_create_state
 
 _policy_lock = asyncio.Lock()
 _auto_purchase_enabled_override: Optional[bool] = None
@@ -82,6 +85,104 @@ def _format_eligible_users(users: List[Tuple[int, str]]) -> str:
     if not users:
         return ""
     return ";".join(f"{uid}:{name}" for uid, name in users)
+
+
+def _purchase_probe_acceptable(probe_out: Dict[str, Any]) -> bool:
+    if probe_out.get("probe_aborted_max_rounds"):
+        return False
+    if probe_out.get("probe_aborted_no_new_rows"):
+        return False
+    pending = probe_out.get("pending_unverified") or []
+    return len(pending) == 0
+
+
+async def batch_login_eligible_runner_users(trigger: str = "manual") -> Dict[str, Any]:
+    """对当时 runner_enabled=true 且订阅有效的用户批量交易端 Login，以提前领取代理。"""
+    from app.proxy_binding import get_session_manager_for_user_id
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    async with AsyncSessionLocal() as db:
+        users = await _eligible_runner_users(db, now_utc)
+    proxy_lifecycle_log(
+        "pre_login",
+        action="start",
+        trigger=trigger,
+        eligible_users=len(users),
+        eligible_users_detail=_format_eligible_users(users),
+    )
+    ok_n = 0
+    fail_n = 0
+    skip_n = 0
+    for uid, uname in users:
+        try:
+            async with AsyncSessionLocal() as db:
+                cfg = await load_trading_config(db, uid)
+            if cfg is None or not (cfg.username or "").strip() or not (cfg.password or "").strip():
+                skip_n += 1
+                proxy_lifecycle_log(
+                    "pre_login",
+                    action="skip",
+                    trigger=trigger,
+                    user_id=uid,
+                    username=uname,
+                    reason="no_trading_config",
+                )
+                continue
+            sm = await get_session_manager_for_user_id(uid)
+            login_ok, login_err, _res, merged = await verify_trade_credentials(
+                sm, cfg.username, cfg.password
+            )
+            if login_ok:
+                async with AsyncSessionLocal() as db:
+                    slot = await get_active_trading_slot(db, uid)
+                    await persist_trading_config(db, uid, slot, merged)
+                    await db.commit()
+                st = await get_or_create_state(uid)
+                st.config = merged
+                st.logged_in = True
+                ok_n += 1
+                proxy_lifecycle_log(
+                    "pre_login",
+                    action="ok",
+                    trigger=trigger,
+                    user_id=uid,
+                    username=uname,
+                )
+            else:
+                fail_n += 1
+                proxy_lifecycle_log(
+                    "pre_login",
+                    action="fail",
+                    trigger=trigger,
+                    user_id=uid,
+                    username=uname,
+                    error=(login_err or "")[:200],
+                )
+        except Exception as ex:
+            fail_n += 1
+            proxy_lifecycle_log(
+                "pre_login",
+                action="error",
+                trigger=trigger,
+                user_id=uid,
+                username=uname,
+                error=repr(ex),
+            )
+    proxy_lifecycle_log(
+        "pre_login",
+        action="complete",
+        trigger=trigger,
+        eligible_users=len(users),
+        ok=ok_n,
+        fail=fail_n,
+        skip=skip_n,
+    )
+    return {
+        "pre_login_eligible": len(users),
+        "pre_login_ok": ok_n,
+        "pre_login_fail": fail_n,
+        "pre_login_skip": skip_n,
+    }
 
 
 async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
@@ -453,7 +554,7 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
                 target_total=target_total,
                 to_buy=0,
             )
-            return {
+            out = {
                 "eligible_users": eligible_users,
                 "multiplier": multiplier,
                 "assignable_pool": assignable_pool,
@@ -465,6 +566,9 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
                 "probe_rounds": 0,
                 "probe_replacements_total": 0,
             }
+            if eligible_users > 0:
+                out.update(await batch_login_eligible_runner_users(trigger=trigger))
+            return out
 
         proxy_lifecycle_log(
             "purchase",
@@ -530,6 +634,8 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
             )
 
     snapshot.update(probe_out)
+    if int(snapshot.get("eligible_users") or 0) > 0 and _purchase_probe_acceptable(probe_out):
+        snapshot.update(await batch_login_eligible_runner_users(trigger=trigger))
     proxy_lifecycle_log(
         "purchase",
         action="complete",
@@ -666,3 +772,22 @@ def seconds_until_next_auto_release() -> float:
     if now >= target:
         target = target + dt.timedelta(days=1)
     return max(1.0, (target - now).total_seconds())
+
+
+PRE_SELL_PURCHASE_MINUTES_BEFORE = 10
+
+
+def seconds_until_next_pre_sell_purchase(sell_hhmm: str, *, minutes_before: int = PRE_SELL_PURCHASE_MINUTES_BEFORE) -> float:
+    """距下一次「全站开售前 N 分钟」补购触发的秒数（北京时间）。"""
+    p = parse_hhmm(sell_hhmm)
+    if not p:
+        return 86400.0
+    h, mi = p
+    now = beijing_now()
+    sell = dt.datetime(now.year, now.month, now.day, h, mi, 0, tzinfo=BJ)
+    trigger = sell - dt.timedelta(minutes=max(0, int(minutes_before)))
+    if now >= sell:
+        trigger = trigger + dt.timedelta(days=1)
+    elif now >= trigger:
+        return 1.0
+    return max(1.0, (trigger - now).total_seconds())

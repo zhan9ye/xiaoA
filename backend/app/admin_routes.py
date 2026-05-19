@@ -30,6 +30,8 @@ from app.schemas import (
     AdminProxyAkapi1ProbeOut,
     AdminProxyAutoPurchasePolicyIn,
     AdminProxyAutoPurchasePolicyOut,
+    AdminPlatformSellStartIn,
+    AdminPlatformSellStartOut,
     AdminCreateUserIn,
     AdminLoginIn,
     AdminProxyPoolAddIn,
@@ -62,6 +64,7 @@ from app.services.aliyun_ecs_ops import (
     run_instances_then_poll_public_ips_sync,
 )
 from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
+from app.platform_settings_repo import get_platform_sell_start_time, set_platform_sell_start_time
 from app.services.proxy_auto_purchase import get_auto_purchase_policy, set_auto_purchase_policy
 from app.proxy_lifecycle_log import proxy_lifecycle_log
 from app.runner_lifecycle import (
@@ -214,6 +217,29 @@ async def admin_proxy_auto_purchase_policy_put(
         default_enabled=bool(p["default_enabled"]),
         default_multiplier=int(p["default_multiplier"]),
     )
+
+
+@router.get("/platform-sell-start", response_model=AdminPlatformSellStartOut)
+async def admin_platform_sell_start_get(
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminPlatformSellStartOut:
+    sell = await get_platform_sell_start_time(db)
+    return AdminPlatformSellStartOut(sell_start_time=sell)
+
+
+@router.put("/platform-sell-start", response_model=AdminPlatformSellStartOut)
+async def admin_platform_sell_start_put(
+    body: AdminPlatformSellStartIn,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminPlatformSellStartOut:
+    try:
+        sell = await set_platform_sell_start_time(db, body.sell_start_time)
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+    await db.commit()
+    return AdminPlatformSellStartOut(sell_start_time=sell)
 
 
 @router.get("/proxy-pool", response_model=AdminProxyPoolListOut)

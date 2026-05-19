@@ -210,3 +210,9 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE user_operation_logs ADD COLUMN business_summary VARCHAR(256) NOT NULL DEFAULT ''"
                 )
+
+    from app.platform_settings_repo import ensure_platform_settings_row
+
+    async with AsyncSessionLocal() as session:
+        await ensure_platform_settings_row(session)
+        await session.commit()

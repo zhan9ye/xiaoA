@@ -739,3 +739,16 @@ class AdminProxyAutoPurchasePolicyOut(BaseModel):
 class AdminProxyAutoPurchasePolicyIn(BaseModel):
     enabled: bool
     multiplier: int = Field(ge=1, le=20)
+
+
+class AdminPlatformSellStartOut(BaseModel):
+    sell_start_time: str = Field(description="全站开售北京时间 HH:MM")
+
+
+class AdminPlatformSellStartIn(BaseModel):
+    sell_start_time: str = Field(description="全站开售北京时间 HH:MM")
+
+    @field_validator("sell_start_time", mode="before")
+    @classmethod
+    def _v_platform_sell_start(cls, v: Any) -> str:
+        return _normalize_hhmm_beijing(str(v or ""))

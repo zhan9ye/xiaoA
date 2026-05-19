@@ -50,6 +50,22 @@ async def _wait_interruptible(state: AppState, seconds: float) -> None:
         pass
 
 
+async def _wait_interruptible_until_sell_resync(
+    state: AppState, seconds: float, sell_rev: int
+) -> bool:
+    """True 表示全站开售时间已变更，调用方应重算调度。"""
+    from app.platform_settings_repo import platform_sell_time_revision
+
+    rem = max(0.0, float(seconds))
+    while rem > 0 and not state.stop_event.is_set():
+        if platform_sell_time_revision() != sell_rev:
+            return True
+        chunk = min(rem, 2.0)
+        await _wait_interruptible(state, chunk)
+        rem -= chunk
+    return platform_sell_time_revision() != sell_rev
+
+
 async def _sleep_between_sell_requests(state: AppState, ms: int) -> None:
     await _wait_interruptible(state, max(0.0, float(ms) / 1000.0))
 
@@ -489,32 +505,39 @@ async def _sell_open_warmup_loop(
     sm,
     log_hub: LogHub,
     start_dt: datetime,
-) -> None:
+    *,
+    should_resync=None,
+) -> bool:
     """
     与 WaitOpen 并行：在开售整点前若干秒内周期性请求 Mnemonic_Get01 预热 TLS/TCP 连接。
     选用 Mnemonic_Get01 而非 My_Subaccount：同域名同端口，返回极小 JSON，无副作用。
     """
     before = max(0, int(settings.sell_warmup_seconds_before_open or 0))
     if before <= 0:
-        return
+        return True
     ping_sec = max(2.0, float(settings.sell_warmup_ping_interval_seconds or 6.0))
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=BJ)
     first_at = start_dt - timedelta(seconds=before)
     while not state.stop_event.is_set():
+        if should_resync is not None and should_resync():
+            return False
         now = beijing_now()
         if now >= start_dt:
-            return
+            return True
         if now < first_at:
-            await wait_interruptible_until_beijing(state.stop_event, first_at)
+            if not await wait_interruptible_until_beijing(
+                state.stop_event, first_at, should_resync=should_resync
+            ):
+                return False
             continue
         cfg = state.config
         if cfg is None:
-            return
+            return False
         rk = cfg.rpc_login_key.strip()
         uid = cfg.rpc_user_id.strip()
         if not rk or not uid:
-            return
+            return False
         v = compute_js_timespan_v()
         ok, code, _parsed, _raw = await post_mnemonic_get01(
             sm, rpc_key=rk, user_id=uid, v=v, lang="cn"
@@ -527,33 +550,47 @@ async def _sell_open_warmup_loop(
         next_deadline = beijing_now() + timedelta(seconds=ping_sec)
         if next_deadline > start_dt:
             next_deadline = start_dt
-        await wait_interruptible_until_beijing(state.stop_event, next_deadline)
+        if not await wait_interruptible_until_beijing(
+            state.stop_event, next_deadline, should_resync=should_resync
+        ):
+            return False
+    return False
 
 
 async def _sell_start_countdown_logs(
     state: AppState,
     start_dt: datetime,
     log_hub: LogHub,
-) -> None:
+    *,
+    should_resync=None,
+) -> bool:
     """开售整点前 60 秒起：每 10 秒一条，最后 10 秒每秒一条。"""
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=BJ)
     milestones = [60, 50, 40, 30, 20, 10] + list(range(9, 0, -1))
     for d in milestones:
         if state.stop_event.is_set():
-            return
+            return False
+        if should_resync is not None and should_resync():
+            return False
         target = start_dt - timedelta(seconds=d)
         now = beijing_now()
         if now >= start_dt:
-            return
+            return True
         if now >= target:
             continue
-        await wait_interruptible_until_beijing(state.stop_event, target)
+        if not await wait_interruptible_until_beijing(
+            state.stop_event, target, should_resync=should_resync
+        ):
+            return False
         if state.stop_event.is_set():
-            return
+            return False
+        if should_resync is not None and should_resync():
+            return False
         if beijing_now() >= start_dt:
-            return
+            return True
         await log_hub.push(LogLevel.info, f"距离开售还有约 {d} 秒")
+    return True
 
 
 async def _hot_window_sell_session(
@@ -955,10 +992,18 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                 break
 
             prep_start: Optional[Tuple[datetime, datetime]] = None
-            if (cfg.sell_start_time or "").strip():
-                prep_start = today_prep_and_start(cfg.sell_start_time)
+            from app.db import AsyncSessionLocal
+            from app.platform_settings_repo import get_platform_sell_start_time, platform_sell_time_revision
+            from app.runner_lifecycle import apply_timed_sell_late_start_skip_flag
+
+            async with AsyncSessionLocal() as _sell_db:
+                sell_hhmm = await get_platform_sell_start_time(_sell_db)
+            sell_rev = platform_sell_time_revision()
+            apply_timed_sell_late_start_skip_flag(state, sell_hhmm)
+            if (sell_hhmm or "").strip():
+                prep_start = today_prep_and_start(sell_hhmm)
                 if not prep_start:
-                    await log_hub.push(LogLevel.warn, "sell_start_time 无法解析，跳过定时等待")
+                    await log_hub.push(LogLevel.warn, "全站开售时间无法解析，跳过定时等待")
 
             if prep_start:
                 prep_dt, start_dt = prep_start
@@ -974,7 +1019,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                         LogLevel.info,
                         f"内部等待：约 {sec / 3600:.1f} 小时至北京时间次日 0 点",
                     )
-                    await _wait_interruptible(state, sec)
+                    if await _wait_interruptible_until_sell_resync(state, sec, sell_rev):
+                        await log_hub.push(LogLevel.info, "全站开售时间已更新，按新时刻重新调度")
+                        continue
                     continue
 
                 sell_started = beijing_now() >= start_dt
@@ -994,7 +1041,9 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
 
                 s1 = seconds_until_beijing(prep_dt)
                 if s1 > 0:
-                    await _wait_interruptible(state, s1)
+                    if await _wait_interruptible_until_sell_resync(state, s1, sell_rev):
+                        await log_hub.push(LogLevel.info, "全站开售时间已更新，按新时刻重新调度")
+                        continue
                 if state.stop_event.is_set():
                     break
 
@@ -1070,15 +1119,24 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                         state.runner_must_refresh_trading_cache = False
 
                         if beijing_now() < start_dt:
-                            await asyncio.gather(
+                            should_resync = lambda: platform_sell_time_revision() != sell_rev
+                            open_ok, _, _ = await asyncio.gather(
                                 wait_open_phases_beijing(
                                     state.stop_event,
                                     start_dt,
                                     settings.sell_wait_open_wake_early_ms,
+                                    should_resync=should_resync,
                                 ),
-                                _sell_open_warmup_loop(state, sm, log_hub, start_dt),
-                                _sell_start_countdown_logs(state, start_dt, log_hub),
+                                _sell_open_warmup_loop(
+                                    state, sm, log_hub, start_dt, should_resync=should_resync
+                                ),
+                                _sell_start_countdown_logs(
+                                    state, start_dt, log_hub, should_resync=should_resync
+                                ),
                             )
+                            if should_resync() or not open_ok:
+                                await log_hub.push(LogLevel.info, "全站开售时间已更新，按新时刻重新调度")
+                                continue
                         if state.stop_event.is_set():
                             break
                     else:
