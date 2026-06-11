@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.schemas import AppConfigIn
+from app.services.sold_son_store import sold_son_ids_for_today
 
 
 def resolve_son_id(row: Dict[str, Any]) -> Optional[str]:
@@ -313,6 +314,65 @@ def effective_listing_amount_str(cfg: AppConfigIn, son_id: str, full_amount_str:
     except ValueError:
         pass
     return token
+
+
+def no_pending_subaccounts_for_sell(
+    items: List[Dict[str, Any]], cfg: AppConfigIn, today_bj: str
+) -> bool:
+    """
+    True：当日已无待售子账号（已售完、不符合运行参数、或未配置挂售数量）。
+    此时允许主账户参与自动售卖（即使默认「不卖」）。
+    """
+    sold_ids = sold_son_ids_for_today(cfg.sold_son_ids_json, today_bj)
+    for row in items:
+        if is_main_account_row(row):
+            continue
+        rpc_son = ace_sell_rpc_son_id(row)
+        if not rpc_son:
+            continue
+        ok_el, _ = subaccount_eligible_for_ace_sell(row, cfg)
+        if not ok_el:
+            continue
+        tid = ace_sell_track_id(row)
+        if not tid or tid in sold_ids:
+            continue
+        full = ace_amount_string_for_rpc(row)
+        if not full:
+            continue
+        if effective_listing_amount_str(cfg, rpc_son, full):
+            return False
+    return True
+
+
+def runner_listing_amount_for_row(
+    cfg: AppConfigIn,
+    row: Dict[str, Any],
+    *,
+    only_main_remaining: bool = False,
+) -> str:
+    """
+    Runner 实际挂售数量。
+    子账号：沿用 listing 覆盖，缺省为全部股数。
+    主账户：默认不卖；仅当无待售子账号时，按显式配置或全部股数参与售卖。
+    """
+    full_cnt = ace_amount_string_for_rpc(row)
+    if not full_cnt:
+        return ""
+    sid = listing_amount_key_for_row(row)
+    if is_main_account_row(row) and only_main_remaining:
+        m = parse_listing_amounts_map(cfg.listing_amounts_json)
+        v = m.get("")
+        if v is not None and str(v).strip() != "":
+            token = _normalize_amount_token(v)
+            try:
+                n = float(token)
+                if n > 0:
+                    return token
+            except ValueError:
+                if token:
+                    return token
+        return _normalize_amount_token(full_cnt)
+    return effective_listing_amount_str(cfg, sid, full_cnt)
 
 
 def sort_subaccounts_for_sell(rows: List[Dict[str, Any]], cfg: AppConfigIn) -> List[Dict[str, Any]]:

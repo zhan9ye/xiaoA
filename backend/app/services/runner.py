@@ -27,10 +27,10 @@ from app.services.selling_eligibility import (
     ace_amount_string_for_rpc,
     ace_sell_rpc_son_id,
     ace_sell_track_id,
-    effective_listing_amount_str,
+    no_pending_subaccounts_for_sell,
     parse_main_account_info_json,
-    listing_amount_key_for_row,
     resolve_subaccount_display_name,
+    runner_listing_amount_for_row,
     sort_subaccounts_for_sell,
     subaccount_eligible_for_ace_sell,
 )
@@ -349,12 +349,9 @@ def _ensure_runner_main_account(items: List[dict], cfg: AppConfigIn) -> List[dic
     return [_runner_main_account_row(cfg), *rest]
 
 
-def _runner_effective_count(cfg: AppConfigIn, row: dict) -> str:
-    full_cnt = ace_amount_string_for_rpc(row)
-    if not full_cnt:
-        return ""
-    # 主账户也遵循挂售数量配置：若为“不卖”（0/空），则不参与自动售卖。
-    return effective_listing_amount_str(cfg, listing_amount_key_for_row(row), full_cnt)
+def _runner_effective_count(cfg: AppConfigIn, row: dict, *, items: List[dict], today: str) -> str:
+    only_main = no_pending_subaccounts_for_sell(items, cfg, today)
+    return runner_listing_amount_for_row(cfg, row, only_main_remaining=only_main)
 
 
 async def _run_hot_maybe_recover_relogin(
@@ -734,7 +731,7 @@ def _hot_window_pending_rows(items: List[dict], cfg: AppConfigIn, today: str) ->
         tid = ace_sell_track_id(row)
         if not tid or tid in sold_ids:
             continue
-        if not _runner_effective_count(cfg, row):
+        if not _runner_effective_count(cfg, row, items=items, today=today):
             continue
         out.append(row)
     return out
@@ -763,7 +760,7 @@ def _pick_next_hot_row(
             continue
         if skip_track and tid == skip_track:
             continue
-        if not _runner_effective_count(cfg, row):
+        if not _runner_effective_count(cfg, row, items=items, today=today):
             continue
         return row
     return None
@@ -863,7 +860,7 @@ async def _hot_slot_sell_loop(
         row = current_row
         track_id = current_track
         rpc_son_id = ace_sell_rpc_son_id(row)
-        cnt = _runner_effective_count(cfg, row)
+        cnt = _runner_effective_count(cfg, row, items=items, today=today)
         if not cnt:
             await release_track()
             current_row = None
@@ -1067,7 +1064,7 @@ async def _hot_window_sell_session(
 
     pending = _hot_window_pending_rows(items, cfg, today)
     if not pending:
-        await log_hub.push(LogLevel.info, "当日待售子账号已处理完毕：无可发起项")
+        await log_hub.push(LogLevel.info, "当日待售账号已处理完毕：子账号与主账户均无可发起项")
         return False, False, False
 
     rk0 = cfg.rpc_login_key.strip()
@@ -1337,9 +1334,19 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                         )
 
                 if not items:
-                    await log_hub.push(LogLevel.warn, "子账号列表为空，跳过售卖")
-                    await _wait_interruptible(state, interval)
-                    continue
+                    cfg_empty = state.config
+                    if cfg_empty is None:
+                        break
+                    main_probe = _runner_main_account_row(cfg_empty)
+                    if not runner_listing_amount_for_row(
+                        cfg_empty,
+                        main_probe,
+                        only_main_remaining=True,
+                    ):
+                        await log_hub.push(LogLevel.warn, "子账号列表为空且主账户无可售数量，跳过售卖")
+                        await _wait_interruptible(state, interval)
+                        continue
+                    await log_hub.push(LogLevel.info, "子账号列表为空，将进入售卖流程（主账户）")
 
                 cfg = state.config
                 if cfg is None:
