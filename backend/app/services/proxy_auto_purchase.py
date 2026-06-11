@@ -17,7 +17,8 @@ from app.services.aliyun_ecs_ops import (
     run_instances_then_poll_public_ips_sync,
 )
 from app.services.beijing_time import BJ, beijing_now, parse_hhmm
-from app.services.login_service import verify_trade_credentials
+from app.services.login_response_parse import merge_from_rpc_login
+from app.services.login_service import rpc_login
 from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
 from app.settings import settings
 from app.trading_config_repo import get_active_trading_slot, load_trading_config, persist_trading_config
@@ -129,10 +130,9 @@ async def batch_login_eligible_runner_users(trigger: str = "manual") -> Dict[str
                 )
                 continue
             sm = await get_session_manager_for_user_id(uid)
-            login_ok, login_err, _res, merged = await verify_trade_credentials(
-                sm, cfg.username, cfg.password
-            )
-            if login_ok:
+            login_res = await rpc_login(sm, cfg.username, cfg.password)
+            if login_res.ok:
+                merged, _ = merge_from_rpc_login(cfg, login_res.response_body)
                 async with AsyncSessionLocal() as db:
                     slot = await get_active_trading_slot(db, uid)
                     await persist_trading_config(db, uid, slot, merged)
@@ -150,13 +150,14 @@ async def batch_login_eligible_runner_users(trigger: str = "manual") -> Dict[str
                 )
             else:
                 fail_n += 1
+                err_msg = (login_res.message or "登录失败")[:200]
                 proxy_lifecycle_log(
                     "pre_login",
                     action="fail",
                     trigger=trigger,
                     user_id=uid,
                     username=uname,
-                    error=(login_err or "")[:200],
+                    error=err_msg,
                 )
         except Exception as ex:
             fail_n += 1
