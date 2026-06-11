@@ -19,7 +19,7 @@ from app.services.login_response_parse import merge_from_rpc_login
 from app.services.login_service import rpc_login
 from app.services.log_hub import LogHub, LogLevel
 from app.services.mnemonic_rpc_service import parse_mnemonic_get01_response, post_mnemonic_get01
-from app.services.mnemonic_segments import derive_mnemonic_str1
+from app.services.mnemonic_segments import derive_mnemonic_str1, split_mnemonic_csv
 from app.services.runner_fetch_guard import set_sub_fetch_allowed
 from app.services.runner_lease import get_runner_lease_holder_id, renew_runner_lease_if_holder, try_acquire_runner_lease
 from app.services.rpc_auth_signals import json_indicates_rpc_not_logged_in
@@ -146,7 +146,7 @@ async def _refresh_sell_mnemonic_cache(
     mkey = meta["mnemonickey"]
     mstr = derive_mnemonic_str1(cfg.mnemonic, mid1) or ""
     if not mstr:
-        segs = [p.strip() for p in (cfg.mnemonic or "").split(",") if p.strip()]
+        segs = [p for p in split_mnemonic_csv(cfg.mnemonic or "") if p]
         await log_hub.push(
             LogLevel.error,
             (

@@ -640,15 +640,34 @@ const creditsPackagesHasMore = computed(
 
 const sellSortDirty = computed(() => sellSortChoiceUi.value !== sellSortChoiceCommitted.value);
 
+function normalizeMnemonicPart(s) {
+  return String(s).normalize("NFKC").trim();
+}
+
+/** 仅用于输入/保存时规范化；加载已存数据时不调用，避免过滤掉合法历史内容。 */
 function sanitizeMnemonicPart(s) {
-  return String(s).trim().replace(MNEMONIC_PART_RE, "").slice(0, 4);
+  return normalizeMnemonicPart(s).replace(MNEMONIC_PART_RE, "").slice(0, 4);
 }
 
 function splitMnemonicCsv(csv) {
-  const parts = String(csv || "")
-    .split(",")
-    .map((x) => sanitizeMnemonicPart(x));
+  const raw = String(csv || "").trim();
   const out = Array.from({ length: MNEMONIC_SEGMENTS }, () => "");
+  if (!raw) return out;
+
+  let parts;
+  if (raw.includes(",") || raw.includes("，")) {
+    parts = raw.split(/[,，]/).map((x) => normalizeMnemonicPart(x));
+  } else {
+    const compact = raw.replace(/\s+/g, "");
+    if (/^\d{48}$/.test(compact)) {
+      parts = [];
+      for (let i = 0; i < MNEMONIC_SEGMENTS; i++) {
+        parts.push(compact.slice(i * 4, i * 4 + 4));
+      }
+    } else {
+      parts = [normalizeMnemonicPart(raw)];
+    }
+  }
   for (let i = 0; i < MNEMONIC_SEGMENTS; i++) out[i] = parts[i] || "";
   return out;
 }

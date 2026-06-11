@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Optional
 
 from app.schemas import AppConfigIn
-from app.services.mnemonic_segments import MNEMONIC_SEGMENTS, is_valid_mnemonic_segment
+from app.services.mnemonic_segments import (
+    MNEMONIC_SEGMENTS,
+    is_valid_mnemonic_segment,
+    split_mnemonic_csv,
+)
 
 
 def trading_config_field_prompt(field_label: str) -> str:
@@ -31,7 +35,7 @@ def trading_config_start_block_reason(cfg: Optional[AppConfigIn]) -> Optional[st
     if not raw:
         return trading_config_field_prompt("助记词")
 
-    parts = [p.strip() for p in raw.split(",")]
+    parts = split_mnemonic_csv(raw)
     if len(parts) < MNEMONIC_SEGMENTS:
         return trading_config_field_prompt("助记词")
     for seg in parts[:MNEMONIC_SEGMENTS]:
