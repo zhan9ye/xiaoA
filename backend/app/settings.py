@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     subaccount_max_pages: int = 200
     # 运行任务每轮之间的等待秒数（登录 → 子账号 → Mnemonic_Get01 → ACE_Sell_Son 之后）
     runner_loop_interval_seconds: int = 10
-    # RPC 请求超时秒数（httpx）；亦为 HotWindow 两波售卖之间的固定间隔秒数
+    # RPC 请求超时秒数（httpx 单次读写上限）
     rpc_timeout_seconds: float = 10.0
     # HotWindow：每波并发多少路 ACE_Sell_Son（不同子账户；过高易 429）
     hot_window_concurrency: int = 1
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # 配置了 sell_start_time 时：仅当「北京时间 ≥ 开售时刻 + 本秒数」后，ACE_Sell_Son 返回「本日交易通道已關閉」才视为真收工。
     # 避免上游晚 1～2 秒开门时，整点请求误把「尚未开放」当成通道已关。
     sell_channel_closed_trust_after_seconds: int = 60
-    # 信任窗口内收到「通道关闭」后，两次 ACE 重试之间的间隔毫秒（过小易 503，默认 100）
+    # 信任窗口内「通道关闭」/失败重试间隔毫秒；定时开售首轮 ACE 亦不早于开售+本毫秒数
     sell_channel_closed_grace_retry_ms: int = 100
     # 停止后再开始、未登录后补拉子账号：最多尝试次数与间隔（毫秒）
     sell_resume_sub_fetch_max_attempts: int = 6
@@ -61,9 +61,9 @@ class Settings(BaseSettings):
     sell_prep_retry_delay_seconds: float = 2.0
     # WaitOpen：先睡到 T_open - 本毫秒数再睡到整点（最后组装）
     sell_wait_open_wake_early_ms: int = 50
-    # 定时开售：距开售整点前多少秒起，周期性请求 Mnemonic_Get01 预热 TLS/TCP 连接（0 关闭）
+    # 定时开售：距开售整点前多少秒起，周期性对每条出站代理各请求 Mnemonic_Get01 预热 TLS/TCP（0 关闭）
     sell_warmup_seconds_before_open: int = 15
-    # 预热期间两次 ping 的间隔秒数（下限 2）
+    # 预热期间两轮 ping 的间隔秒数（下限 2）；HotWindow 开售前会再并行预热一轮
     sell_warmup_ping_interval_seconds: float = 6.0
     # 多实例互斥（需共用同一数据库）；单机可 false
     runner_lease_enabled: bool = False

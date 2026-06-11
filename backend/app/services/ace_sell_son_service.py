@@ -4,7 +4,11 @@ from urllib.parse import urlencode
 
 import httpx
 
-from app.middleware_request_log import log_httpx_outbound_request_error_sync
+from app.middleware_request_log import (
+    clear_outbound_request_markers,
+    log_httpx_outbound_request_error_sync,
+    mark_outbound_request_start,
+)
 from app.services.rpc_common import get_rpc_browser_headers
 from app.services.selling_eligibility import ace_sell_rpc_son_id
 from app.services.session_manager import SessionManager
@@ -53,6 +57,7 @@ async def post_ace_sell_son(
     user_id: str,
     v: str,
     lang: str = "cn",
+    proxy_pin_index: Optional[int] = None,
 ) -> Tuple[bool, int, Any, str]:
     """
     POST ACE_Sell_Son / ACE_Sell（application/x-www-form-urlencoded）。
@@ -60,6 +65,9 @@ async def post_ace_sell_son(
     须在已 Login 的同一会话 client 上调用以携带 Cookie。
     """
     client = await sm.client()
+    pin_token = None
+    if proxy_pin_index is not None and sm.outbound_proxy_count() > 0:
+        pin_token = SessionManager.pinned_proxy_index(proxy_pin_index)
     son = str(son_id).strip()
     target_url = settings.ace_sell_main_url if not son else settings.ace_sell_son_url
     data = {
@@ -77,38 +85,47 @@ async def post_ace_sell_son(
         "lang": str(lang),
     }
     try:
-        r = await client.post(
-            target_url,
-            headers=get_rpc_browser_headers(),
-            data=data,
-        )
-    except httpx.RequestError as e:
-        if not sm.uses_multi_proxy_dispatch():
-            try:
-                req_body = urlencode(data, doseq=True)
-            except Exception:
-                req_body = str(data)
-            log_httpx_outbound_request_error_sync(
-                method="POST",
-                url=target_url,
-                req_body=req_body,
-                err=(str(e) or repr(e)),
-                platform_user_id=sm.platform_user_id,
-                proxy_label=sm.outbound_proxy_log_label(),
-                uses_outbound_proxy=sm.uses_outbound_proxy(),
-                proxy_debug=None,
+        try:
+            if not sm.uses_multi_proxy_dispatch():
+                mark_outbound_request_start()
+            r = await client.post(
+                target_url,
+                headers=get_rpc_browser_headers(),
+                data=data,
             )
-        return False, 0, None, str(e)
+        except httpx.RequestError as e:
+            if not sm.uses_multi_proxy_dispatch():
+                try:
+                    req_body = urlencode(data, doseq=True)
+                except Exception:
+                    req_body = str(data)
+                log_httpx_outbound_request_error_sync(
+                    method="POST",
+                    url=target_url,
+                    req_body=req_body,
+                    err=(str(e) or repr(e)),
+                    platform_user_id=sm.platform_user_id,
+                    proxy_label=sm.outbound_proxy_log_label(),
+                    uses_outbound_proxy=sm.uses_outbound_proxy(),
+                )
+                clear_outbound_request_markers()
+            return False, 0, None, str(e)
+        finally:
+            if not sm.uses_multi_proxy_dispatch():
+                clear_outbound_request_markers()
 
-    text = ""
-    parsed: Any = None
-    try:
-        parsed = r.json()
-        text = json.dumps(parsed, ensure_ascii=False, indent=2)
-    except ValueError:
-        text = r.text or ""
+        text = ""
+        parsed: Any = None
+        try:
+            parsed = r.json()
+            text = json.dumps(parsed, ensure_ascii=False, indent=2)
+        except ValueError:
+            text = r.text or ""
 
-    return r.is_success, r.status_code, parsed, text
+        return r.is_success, r.status_code, parsed, text
+    finally:
+        if pin_token is not None:
+            SessionManager.reset_pinned_proxy_index(pin_token)
 
 
 def describe_ace_sell_response(status_code: int, parsed: Any, raw_body: str) -> str:

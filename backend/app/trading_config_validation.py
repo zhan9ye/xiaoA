@@ -5,8 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from app.schemas import AppConfigIn
-
-MNEMONIC_SEGMENTS = 12
+from app.services.mnemonic_segments import MNEMONIC_SEGMENTS, is_valid_mnemonic_segment
 
 
 def trading_config_field_prompt(field_label: str) -> str:
@@ -36,6 +35,6 @@ def trading_config_start_block_reason(cfg: Optional[AppConfigIn]) -> Optional[st
     if len(parts) < MNEMONIC_SEGMENTS:
         return trading_config_field_prompt("助记词")
     for seg in parts[:MNEMONIC_SEGMENTS]:
-        if len(seg) != 4 or not seg.isdigit():
+        if not is_valid_mnemonic_segment(seg):
             return trading_config_field_prompt("助记词")
     return None

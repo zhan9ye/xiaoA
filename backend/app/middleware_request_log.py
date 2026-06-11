@@ -1,20 +1,31 @@
 """
 出站 HTTP（httpx）文件日志：仅当请求主机匹配配置列表（默认 akapi1.com，含 www.akapi1.com）时记录。
-每条带 platform_user_id（控制台用户）及 proxy_label（代理池条目的 label；直连为 direct；有代理但未填 label 为 (empty)）。请求体仍记录；响应体仅在失败时记录（HTTP 非 2xx 或 JSON Error=true），成功写 (omitted, success)。
+每条带 platform_user_id、proxy_label、ACE 售卖时的 ace_seq、elapsed_ms（请求耗时毫秒）。
+请求体仍记录；响应体仅在失败时记录（HTTP 非 2xx 或 JSON Error=true），成功写 (omitted, success)。
 正文按长度截断；不做脱敏（日志文件可能含密码、token、助记词等，请限制文件权限并勿外传）。
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
+
+# 由 SessionManager 在 post 前写入，供 response 钩子 / 错误补记读取
+_outbound_ace_seq: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "_outbound_ace_seq", default=None
+)
+_outbound_req_start_mono: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "_outbound_req_start_mono", default=None
+)
 
 from app.settings import settings
 
@@ -71,6 +82,64 @@ def _should_log_response_body(status_code: int, resp_bytes: bytes) -> bool:
     except (json.JSONDecodeError, TypeError, ValueError, UnicodeError):
         pass
     return False
+
+
+def mark_outbound_request_start(*, ace_seq: Optional[int] = None) -> None:
+    """标记出站请求开始时刻（monotonic），可选附带 ACE 售卖序号。"""
+    _outbound_req_start_mono.set(time.monotonic())
+    if ace_seq is not None:
+        _outbound_ace_seq.set(int(ace_seq))
+
+
+def clear_outbound_request_markers() -> None:
+    _outbound_req_start_mono.set(None)
+    try:
+        _outbound_ace_seq.set(None)
+    except LookupError:
+        pass
+
+
+def _elapsed_ms_from_monotonic_start() -> Optional[int]:
+    start = _outbound_req_start_mono.get()
+    if start is None:
+        return None
+    return max(0, int((time.monotonic() - start) * 1000))
+
+
+def _elapsed_ms_from_response(response: httpx.Response) -> Optional[int]:
+    try:
+        el = response.elapsed
+        if el is not None:
+            return max(0, int(el.total_seconds() * 1000))
+    except Exception:
+        pass
+    return _elapsed_ms_from_monotonic_start()
+
+
+def _outbound_log_who(
+    *,
+    platform_user_id: Optional[int],
+    proxy_label: Optional[str],
+    uses_outbound_proxy: bool,
+    ace_seq: Optional[int] = None,
+    elapsed_ms: Optional[int] = None,
+) -> str:
+    uid_part = (
+        f"platform_user_id={platform_user_id}"
+        if platform_user_id is not None
+        else "platform_user_id=unknown"
+    )
+    lab = (proxy_label or "").strip()
+    if uses_outbound_proxy:
+        lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
+    else:
+        lab_part = "proxy_label=direct"
+    parts = [uid_part, lab_part]
+    if ace_seq is not None:
+        parts.append(f"ace_seq={ace_seq}")
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms}")
+    return " | ".join(parts)
 
 
 def outbound_host_matches(host: str) -> bool:
@@ -131,7 +200,8 @@ def log_httpx_outbound_request_error_sync(
     platform_user_id: Optional[int] = None,
     proxy_label: Optional[str] = None,
     uses_outbound_proxy: bool = False,
-    proxy_debug: Optional[str] = None,
+    ace_seq: Optional[int] = None,
+    elapsed_ms: Optional[int] = None,
 ) -> None:
     """
     httpx 在收到 Response 前失败（超时、断连等 RequestError）时不会触发 response 事件钩子；
@@ -158,15 +228,15 @@ def log_httpx_outbound_request_error_sync(
     if len(req_body or "") > max_body:
         body_out += f" [BODY_TRUNCATED total_chars={len(req_body)}]"
 
-    uid_part = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
-    lab = (proxy_label or "").strip()
-    if uses_outbound_proxy:
-        lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
-    else:
-        lab_part = "proxy_label=direct"
-    dbg = (proxy_debug or "").strip()
-    dbg_part = f" | {dbg}" if dbg else ""
-    who = f"{uid_part} | {lab_part}{dbg_part}"
+    seq = ace_seq if ace_seq is not None else _outbound_ace_seq.get()
+    ms = elapsed_ms if elapsed_ms is not None else _elapsed_ms_from_monotonic_start()
+    who = _outbound_log_who(
+        platform_user_id=platform_user_id,
+        proxy_label=proxy_label,
+        uses_outbound_proxy=uses_outbound_proxy,
+        ace_seq=seq,
+        elapsed_ms=ms,
+    )
     err_one = (err or "").strip().replace("\n", " ")
     if not err_one:
         err_one = "(request error with empty message)"
@@ -189,7 +259,6 @@ async def httpx_outbound_response_log_hook(
     platform_user_id: Optional[int] = None,
     proxy_label: Optional[str] = None,
     uses_outbound_proxy: bool = False,
-    proxy_debug: Optional[str] = None,
 ) -> None:
     if not settings.request_log_enabled:
         return
@@ -237,15 +306,13 @@ async def httpx_outbound_response_log_hook(
     except Exception:
         url_str = ""
 
-    uid_part = f"platform_user_id={platform_user_id}" if platform_user_id is not None else "platform_user_id=unknown"
-    lab = (proxy_label or "").strip()
-    if uses_outbound_proxy:
-        lab_part = f"proxy_label={lab}" if lab else "proxy_label=(empty)"
-    else:
-        lab_part = "proxy_label=direct"
-    dbg = (proxy_debug or "").strip()
-    dbg_part = f" | {dbg}" if dbg else ""
-    who = f"{uid_part} | {lab_part}{dbg_part}"
+    who = _outbound_log_who(
+        platform_user_id=platform_user_id,
+        proxy_label=proxy_label,
+        uses_outbound_proxy=uses_outbound_proxy,
+        ace_seq=_outbound_ace_seq.get(),
+        elapsed_ms=_elapsed_ms_from_response(response),
+    )
 
     lg.info(
         "%s | OUTBOUND %s %s | req_body=%s\nRESPONSE status=%s content-type=%s | body=%s",

@@ -11,8 +11,10 @@ import httpx
 from httpx import AsyncBaseTransport
 
 from app.middleware_request_log import (
+    clear_outbound_request_markers,
     httpx_outbound_response_log_hook,
     log_httpx_outbound_request_error_sync,
+    mark_outbound_request_start,
 )
 from app.settings import settings
 
@@ -23,8 +25,9 @@ _multi_proxy_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar
 _multi_proxy_label_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_multi_proxy_label_ctx", default=None
 )
-_multi_proxy_ace_dbg_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "_multi_proxy_ace_dbg_ctx", default=None
+# HotWindow 槽位固定出口：设置后 ACE 售卖 POST 走指定代理下标（不轮询）
+_pinned_proxy_idx: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "_pinned_proxy_idx", default=None
 )
 
 
@@ -152,23 +155,21 @@ class _PerRequestProxyClient:
     async def post(self, *args, **kwargs):
         if not self._proxies:
             return await self._inner.post(*args, **kwargs)
+        ace_seq_for_log: Optional[int] = None
         async with self._lock:
-            ace_dbg: Optional[str] = None
-            if self._is_ace_sell_request(args, kwargs):
+            pinned = _pinned_proxy_idx.get()
+            if pinned is not None and self._proxies:
+                idx = int(pinned) % len(self._proxies)
+            elif self._is_ace_sell_request(args, kwargs):
                 idx = self._ace_proxy_idx % len(self._proxies)
                 group_size = max(1, int(settings.hot_window_concurrency or 1))
-                group_pos = self._ace_count_in_group + 1
-                self._ace_seq += 1
-                ace_dbg = (
-                    f"ace_seq={self._ace_seq}"
-                    f",group_idx={self._ace_group_idx}"
-                    f",group_pos={group_pos}/{group_size}"
-                )
                 self._ace_count_in_group += 1
                 if self._ace_count_in_group >= group_size:
                     self._ace_count_in_group = 0
                     self._ace_proxy_idx = (self._ace_proxy_idx + 1) % len(self._proxies)
                     self._ace_group_idx += 1
+                self._ace_seq += 1
+                ace_seq_for_log = self._ace_seq
             else:
                 idx = self._i % len(self._proxies)
                 self._i += 1
@@ -176,9 +177,9 @@ class _PerRequestProxyClient:
             lab = self._labels[idx] if idx < len(self._labels) else None
         token = _multi_proxy_ctx.set(prox)
         label_token = _multi_proxy_label_ctx.set(lab)
-        ace_dbg_token = _multi_proxy_ace_dbg_ctx.set(ace_dbg)
         url_str = self._extract_url(args, kwargs)
         req_body_preview = self._serialize_post_data(kwargs.get("data"))
+        mark_outbound_request_start(ace_seq=ace_seq_for_log)
         try:
             return await self._inner.post(*args, **kwargs)
         except httpx.RequestError as e:
@@ -190,11 +191,11 @@ class _PerRequestProxyClient:
                 platform_user_id=self._platform_user_id,
                 proxy_label=lab,
                 uses_outbound_proxy=True,
-                proxy_debug=ace_dbg,
+                ace_seq=ace_seq_for_log,
             )
             raise
         finally:
-            _multi_proxy_ace_dbg_ctx.reset(ace_dbg_token)
+            clear_outbound_request_markers()
             _multi_proxy_label_ctx.reset(label_token)
             _multi_proxy_ctx.reset(token)
 
@@ -236,6 +237,17 @@ class SessionManager:
     def uses_outbound_proxy(self) -> bool:
         return bool(self._proxy_urls)
 
+    def outbound_proxy_count(self) -> int:
+        return len(self._proxy_urls)
+
+    @staticmethod
+    def pinned_proxy_index(proxy_index: int) -> contextvars.Token:
+        return _pinned_proxy_idx.set(int(proxy_index))
+
+    @staticmethod
+    def reset_pinned_proxy_index(token: contextvars.Token) -> None:
+        _pinned_proxy_idx.reset(token)
+
     def outbound_proxy_log_label(self) -> Optional[str]:
         """直连或单条固定代理时用于文件日志；多代理轮询由 _PerRequestProxyClient 侧记录。"""
         if len(self._proxy_urls) == 1:
@@ -273,19 +285,15 @@ class SessionManager:
                     async def _response_log_hook(response: httpx.Response) -> None:
                         if self._use_multi_dispatch:
                             proxy_label = _multi_proxy_label_ctx.get()
-                            ace_debug = _multi_proxy_ace_dbg_ctx.get()
                         elif len(self._proxy_labels) == 1:
                             proxy_label = self._proxy_labels[0]
-                            ace_debug = None
                         else:
                             proxy_label = None
-                            ace_debug = None
                         await httpx_outbound_response_log_hook(
                             response,
                             platform_user_id=uid,
                             proxy_label=proxy_label,
                             uses_outbound_proxy=bool(self._proxy_urls),
-                            proxy_debug=ace_debug,
                         )
 
                     kw["event_hooks"] = {"response": [_response_log_hook]}

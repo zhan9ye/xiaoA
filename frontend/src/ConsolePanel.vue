@@ -9,8 +9,9 @@ const emit = defineEmits(["logout"]);
 const tradeUser = ref("");
 const tradePassword = ref("");
 const keyToken = ref("");
-/** 12 段，每段最多 4 位数字；保存时拼接为逗号分隔写入 mnemonic */
+/** 12 段，每段最多 4 个字符（数字、英文或中文）；保存时拼接为逗号分隔写入 mnemonic */
 const MNEMONIC_SEGMENTS = 12;
+const MNEMONIC_PART_RE = /[^\dA-Za-z\u4e00-\u9fff]/g;
 const mnemonicParts = ref(Array.from({ length: MNEMONIC_SEGMENTS }, () => ""));
 const quantityStartLimit = ref(1000);
 const requestIntervalMs = ref(1000);
@@ -639,30 +640,53 @@ const creditsPackagesHasMore = computed(
 
 const sellSortDirty = computed(() => sellSortChoiceUi.value !== sellSortChoiceCommitted.value);
 
+function sanitizeMnemonicPart(s) {
+  return String(s).trim().replace(MNEMONIC_PART_RE, "").slice(0, 4);
+}
+
 function splitMnemonicCsv(csv) {
   const parts = String(csv || "")
     .split(",")
-    .map((x) => x.trim().replace(/[^\d]/g, "").slice(0, 4));
+    .map((x) => sanitizeMnemonicPart(x));
   const out = Array.from({ length: MNEMONIC_SEGMENTS }, () => "");
   for (let i = 0; i < MNEMONIC_SEGMENTS; i++) out[i] = parts[i] || "";
   return out;
 }
 
 function joinMnemonicCsv() {
-  const parts = mnemonicParts.value.map((s) =>
-    String(s).trim().replace(/[^\d]/g, "").slice(0, 4)
-  );
+  const parts = mnemonicParts.value.map((s) => sanitizeMnemonicPart(s));
   if (parts.every((p) => !p)) return "";
   return parts.join(",");
 }
 
-function onMnemonicPartInput(index, e) {
-  const t = String(e.target.value).replace(/[^\d]/g, "").slice(0, 4);
+const mnemonicComposing = ref(false);
+
+function applyMnemonicPart(index, raw, allowAdvance) {
+  const t = sanitizeMnemonicPart(raw);
   mnemonicParts.value[index] = t;
-  if (t.length === 4 && index < MNEMONIC_SEGMENTS - 1) {
+  const el = document.getElementById(`mnemonic-part-${index}`);
+  if (el && el.value !== t) el.value = t;
+  if (allowAdvance && t.length === 4 && index < MNEMONIC_SEGMENTS - 1) {
     const next = document.getElementById(`mnemonic-part-${index + 1}`);
     if (next) next.focus();
   }
+}
+
+function onMnemonicCompositionStart() {
+  mnemonicComposing.value = true;
+}
+
+function onMnemonicCompositionEnd(index, e) {
+  mnemonicComposing.value = false;
+  applyMnemonicPart(index, e.target.value, true);
+}
+
+function onMnemonicPartInput(index, e) {
+  if (e.isComposing || mnemonicComposing.value) {
+    mnemonicParts.value[index] = e.target.value;
+    return;
+  }
+  applyMnemonicPart(index, e.target.value, true);
 }
 
 async function loadMe() {
@@ -1527,7 +1551,7 @@ onMounted(async () => {
           >
             校验 Google 实时验证码
           </button>
-          <label class="mb-1 block text-xs text-zinc-500">助记词（12 段，每段 4 位数字）</label>
+          <label class="mb-1 block text-xs text-zinc-500">助记词（12 段，每段 4 个字符：数字、英文或中文）</label>
           <div class="mb-2 grid grid-cols-3 gap-2">
             <div v-for="(_p, i) in mnemonicParts" :key="i" class="flex flex-col gap-0.5">
               <span class="text-center text-[10px] text-zinc-600">{{ i + 1 }}</span>
@@ -1535,11 +1559,11 @@ onMounted(async () => {
                 :id="'mnemonic-part-' + i"
                 :value="mnemonicParts[i]"
                 type="text"
-                inputmode="numeric"
-                maxlength="4"
-                class="w-full rounded border border-line bg-black/40 px-1.5 py-1.5 text-center font-mono text-xs tabular-nums outline-none ring-blue-500 focus:ring-2"
-                placeholder="0000"
+                class="w-full rounded border border-line bg-black/40 px-1.5 py-1.5 text-center font-mono text-xs outline-none ring-blue-500 focus:ring-2"
+                placeholder="4 字符"
                 autocomplete="off"
+                @compositionstart="onMnemonicCompositionStart"
+                @compositionend="onMnemonicCompositionEnd(i, $event)"
                 @input="onMnemonicPartInput(i, $event)"
               />
             </div>

@@ -53,7 +53,7 @@ class AppConfigFormIn(BaseModel):
     mnemonic: str = Field(
         default="",
         description=(
-            "12 组逗号分隔的 4 位数字（如 1148,1015,...），与 ACE 接口 mnemonicstr1 按序号对应；"
+            "12 组逗号分隔，每段 4 个字符（数字、英文或中文，如 1148,love,春天,...），与 ACE 接口 mnemonicstr1 按序号对应；"
             "提交空串时保留服务端已存值"
         ),
     )
@@ -339,7 +339,7 @@ class AceSellSonIn(BaseModel):
     """
     ACE_Sell_Son 业务参数（与 akapi1 抓包字段对应）。
     不传 mnemonic_key 时会先请求 Mnemonic_Get01 获取 mnemonicid1 / mnemonickey；
-    mnemonicstr1 仍由配置中 12 段数字与 mnemonic_id1 推导（mnemonic_id1 未传时以接口返回为准）。
+    mnemonicstr1 仍由配置中 12 段助记词与 mnemonic_id1 推导（mnemonic_id1 未传时以接口返回为准）。
     """
 
     son_id: str = Field(
@@ -352,7 +352,7 @@ class AceSellSonIn(BaseModel):
     )
     mnemonic_id1: Optional[str] = Field(
         default=None,
-        description="第几段 4 位数字；不传且已调 Mnemonic_Get01 时用接口返回的 mnemonicid1",
+        description="第几段助记词（1～12）；不传且已调 Mnemonic_Get01 时用接口返回的 mnemonicid1",
     )
     mnemonic_key: Optional[str] = Field(
         default=None,

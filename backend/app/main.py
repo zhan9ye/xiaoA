@@ -992,7 +992,7 @@ async def trade_ace_sell_son(
         if not mstr:
             raise HTTPException(
                 status_code=400,
-                detail="mnemonicstr1：请在请求中传入，或确保「助记词/备注」为至少 12 段逗号分隔数字且 mnemonic_id1 为 1～12",
+                detail="mnemonicstr1：请在请求中传入，或确保「助记词/备注」为至少 12 段逗号分隔（每段 4 个数字/英文/中文字符）且 mnemonic_id1 为 1～12",
             )
     ok, code, parsed, raw_out = await post_ace_sell_son(
         sm,

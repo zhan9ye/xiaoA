@@ -1,7 +1,15 @@
 1. 登录代理机
 在 阿里云控制台 里：
 查看公网IP
+curl -4 -v ifconfig.me; echo
+
 curl -4 -s ifconfig.me; echo
+
+acl allowed_src src 115.195.95.102/32
+
+sudo squid -k parse && sudo systemctl reload squid
+
+curl -x http://47.237.219.33:3128 -k -I --connect-timeout 10 https://www.akapi1.com/
 
 看实例是否已设 登录密码 或绑定 密钥对；
 用 Workbench 远程连接 或你本机：
@@ -59,7 +67,7 @@ http://172.19.205.89:3128
 
 在主服务器执行：
 
-curl -x http://47.237.207.104:3128 -k -I --connect-timeout 10 https://www.akapi1.com/
+curl -x http://47.237.215.92:3128 -k -I --connect-timeout 10 https://www.akapi1.com/
 # 能出现 HTTP 响应头（例如 403）即表示 代理 + CONNECT 正常。
 
 sudo tail -f /var/log/squid/access.log 
