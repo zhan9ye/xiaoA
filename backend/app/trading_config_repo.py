@@ -11,6 +11,50 @@ from app.trading_crypto import decrypt_trading_field, encrypt_trading_field
 MAX_TRADING_CONFIG_SLOTS = 3
 
 
+def _encrypted_field_for_persist(plain: str, existing_enc: Optional[str]) -> str:
+    """
+    写入库时的加密字段：新值为空则保留已有密文，禁止空串覆盖（批量 Login 等误 persist 曾导致全站密钥丢失）。
+    """
+    if (plain or "").strip():
+        return encrypt_trading_field(plain)
+    prev = (existing_enc or "").strip()
+    return prev
+
+
+def _cfg_preserving_row_secrets(cfg: AppConfigIn, row: Optional[TradingConfig]) -> AppConfigIn:
+    """合并已有行中的业务字段，避免 probe/Login 产生的空配置抹掉运行参数与 JSON 状态。"""
+    if row is None:
+        return cfg
+    updates: Dict[str, Any] = {}
+    if not (cfg.key_token or "").strip() and (row.key_token_enc or "").strip():
+        try:
+            updates["key_token"] = decrypt_trading_field(row.key_token_enc)
+        except ValueError:
+            pass
+    if not (cfg.mnemonic or "").strip() and (row.mnemonic_enc or "").strip():
+        try:
+            updates["mnemonic"] = decrypt_trading_field(row.mnemonic_enc)
+        except ValueError:
+            pass
+    old_listing = (row.listing_amounts_json or "").strip() or "{}"
+    new_listing = (cfg.listing_amounts_json or "").strip() or "{}"
+    if new_listing in ("", "{}") and old_listing not in ("", "{}"):
+        updates["listing_amounts_json"] = old_listing
+    old_sold = (row.sold_son_ids_json or "").strip() or "{}"
+    new_sold = (cfg.sold_son_ids_json or "").strip() or "{}"
+    if new_sold in ("", "{}") and old_sold not in ("", "{}"):
+        updates["sold_son_ids_json"] = old_sold
+    if int(cfg.quantity_start_limit or 0) == 0 and int(row.quantity_start_limit or 0) > 0:
+        updates["quantity_start_limit"] = int(row.quantity_start_limit)
+    if not (cfg.run_period_start or "").strip() and (row.run_period_start or "").strip():
+        updates["run_period_start"] = row.run_period_start
+    if not (cfg.run_period_end or "").strip() and (row.run_period_end or "").strip():
+        updates["run_period_end"] = row.run_period_end
+    if not updates:
+        return cfg
+    return cfg.model_copy(update=updates)
+
+
 def _row_to_app_config(row: TradingConfig) -> AppConfigIn:
     try:
         pw = decrypt_trading_field(row.password_enc)
@@ -112,9 +156,12 @@ async def persist_trading_config(
 ) -> None:
     slot = max(0, min(MAX_TRADING_CONFIG_SLOTS - 1, int(slot)))
     row = await session.get(TradingConfig, (user_id, slot))
+    cfg = _cfg_preserving_row_secrets(cfg, row)
+    prev_key_enc = (row.key_token_enc if row else None) or ""
+    prev_mn_enc = (row.mnemonic_enc if row else None) or ""
     pw_enc = encrypt_trading_field(cfg.password)
-    key_enc = encrypt_trading_field(cfg.key_token)
-    mn_enc = encrypt_trading_field(cfg.mnemonic)
+    key_enc = _encrypted_field_for_persist(cfg.key_token, prev_key_enc or None)
+    mn_enc = _encrypted_field_for_persist(cfg.mnemonic, prev_mn_enc or None)
     rk_enc = encrypt_trading_field(cfg.rpc_login_key)
     ssf = (cfg.sell_sort_field or "create_time").strip()
     if ssf not in ("create_time", "ace_amount"):

@@ -1,0 +1,23 @@
+---
+description: 交易配置落库安全：禁止空配置覆盖已存敏感字段
+globs: backend/app/**/*.py
+alwaysApply: false
+---
+
+# 交易配置 persist 安全（历史事故：2026-06 批量 Login 清空全站 Google 密钥/助记词）
+
+## 禁止
+
+- 将 `verify_trade_credentials()` 返回的 `merged` **整份** `persist_trading_config`（该函数从空 probe 构造，不含 key_token/mnemonic/运行参数）。
+- 任意后台任务在 Login 后 persist 时，不得使用**未从数据库加载的完整 cfg** 作为基础。
+
+## 必须
+
+- Login 后只合并 RPC 字段：`merge_from_rpc_login(已有_cfg, response_body)`，与 `runner.py` 一致。
+- `persist_trading_config` 已内置：新值为空的 `key_token`/`mnemonic` **不得覆盖**库内已有密文；改 persist 逻辑时须保留该防护。
+- 涉及批量写 `trading_configs` 的改动：先 `--dry-run` 查 `length(key_token_enc)`/`length(mnemonic_enc)`，部署前备份 `data/app.db`。
+
+## 参考
+
+- 正确批量 Login：`proxy_auto_purchase.batch_login_eligible_runner_users` → `rpc_login` + `merge_from_rpc_login(cfg, ...)`
+- 恢复脚本：`backend/scripts/recover_trading_secrets.py`

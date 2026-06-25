@@ -14,7 +14,7 @@ from app.services.beijing_time import (
     wait_interruptible_until_beijing,
     wait_open_phases_beijing,
 )
-from app.services.channel_closed import response_indicates_channel_closed
+from app.services.channel_closed import response_day_sell_end_reason
 from app.services.login_response_parse import merge_from_rpc_login
 from app.services.login_service import rpc_login
 from app.services.log_hub import LogHub, LogLevel
@@ -917,7 +917,8 @@ async def _hot_slot_sell_loop(
             else (resolve_subaccount_display_name(row) or track_id)
         )
 
-        if response_indicates_channel_closed(parsed, raw_out):
+        day_end_reason = response_day_sell_end_reason(parsed, raw_out)
+        if day_end_reason:
             in_trust = grace_deadline is not None and beijing_now() < grace_deadline
             if in_trust:
                 if not logged_grace_channel:
@@ -933,11 +934,11 @@ async def _hot_slot_sell_loop(
                 true_channel_closed_ev.set()
                 await log_hub.push(
                     LogLevel.warn,
-                    "本日交易通道已關閉（任一槽位确认），全部售卖槽停止",
+                    f"{day_end_reason}（任一槽位确认），全部售卖槽停止",
                 )
             await log_hub.push(
                 LogLevel.warn,
-                f"[{slot_label}] {sub_name}，本日交易通道已關閉，本槽停止",
+                f"[{slot_label}] {sub_name}，{day_end_reason}，本槽停止",
             )
             await release_track()
             return
@@ -1407,7 +1408,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                     sec = seconds_until_next_beijing_midnight()
                     await log_hub.push(
                         LogLevel.warn,
-                        f"本日交易通道已關閉：暂停至北京时间次日 0 点（约 {sec / 3600:.1f} 小时）",
+                        f"当日售卖已结束：暂停至北京时间次日 0 点（约 {sec / 3600:.1f} 小时）",
                     )
                     await _wait_interruptible(state, sec)
                     continue
@@ -1494,7 +1495,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                 sec = seconds_until_next_beijing_midnight()
                 await log_hub.push(
                     LogLevel.warn,
-                    f"本日交易通道已關閉：暂停至北京时间次日 0 点（约 {sec / 3600:.1f} 小时）",
+                    f"当日售卖已结束：暂停至北京时间次日 0 点（约 {sec / 3600:.1f} 小时）",
                 )
                 await _wait_interruptible(state, sec)
                 continue
