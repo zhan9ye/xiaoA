@@ -581,6 +581,7 @@ class AdminProxyPoolAddIn(BaseModel):
 
     proxy_url: str = Field(..., min_length=8, description="完整代理 URL，含协议与端口")
     label: str = Field(default="", max_length=128)
+    pool_role: str = Field(default="sell", description="sell=售卖池；probe=侦察池")
 
 
 class AdminProxyPoolRow(BaseModel):
@@ -592,6 +593,7 @@ class AdminProxyPoolRow(BaseModel):
         True,
         description="为 False 时表示尚未通过出站 Login 探测，不能被自动领取绑定",
     )
+    pool_role: str = Field(default="sell", description="sell 或 probe")
     assigned_user_id: Optional[int] = None
     assigned_username: Optional[str] = None
     proxy_host_preview: str = ""
@@ -606,6 +608,7 @@ class AdminProxyPoolPatchIn(BaseModel):
     release_assigned: bool = False
     label: Optional[str] = None
     proxy_url: Optional[str] = None
+    pool_role: Optional[str] = None
 
 
 class AdminProxyAkapi1ProbeOut(BaseModel):
@@ -752,3 +755,61 @@ class AdminPlatformSellStartIn(BaseModel):
     @classmethod
     def _v_platform_sell_start(cls, v: Any) -> str:
         return _normalize_hhmm_beijing(str(v or ""))
+
+
+class AdminSellOpenProbeConfigOut(BaseModel):
+    probe_enabled: bool = True
+    shared_sell_pool_enabled: bool = True
+    probe_user_id: Optional[int] = None
+    probe_parallel: int = 2
+    probe_round_gap_ms: int = 40
+    probe_per_proxy_max_hits: int = 2
+    probe_window_seconds: int = 120
+    open_timeout_default_ms: int = 350
+    open_timeout_min_ms: int = 250
+    open_timeout_max_ms: int = 500
+    open_timeout_margin_ms: int = 50
+    probe_cooldown_default_ms: int = 3000
+    probe_cooldown_min_ms: int = 2000
+    probe_cooldown_max_ms: int = 5000
+    sell_cooldown_default_ms: int = 11000
+    sell_proxy_reserve: int = 4
+    clock_fallback_ms: int = 2000
+    calibration_enabled: bool = False
+    early_429_alert: bool = False
+    pool_snapshot: Dict[str, int] = Field(default_factory=dict)
+
+
+class AdminSellOpenProbeConfigIn(BaseModel):
+    probe_enabled: Optional[bool] = None
+    shared_sell_pool_enabled: Optional[bool] = None
+    probe_user_id: Optional[int] = None
+    probe_parallel: Optional[int] = Field(default=None, ge=1, le=8)
+    probe_round_gap_ms: Optional[int] = Field(default=None, ge=10, le=2000)
+    probe_per_proxy_max_hits: Optional[int] = Field(default=None, ge=1, le=5)
+    probe_window_seconds: Optional[int] = Field(default=None, ge=10, le=600)
+    open_timeout_default_ms: Optional[int] = Field(default=None, ge=100, le=5000)
+    open_timeout_min_ms: Optional[int] = Field(default=None, ge=100, le=2000)
+    open_timeout_max_ms: Optional[int] = Field(default=None, ge=100, le=5000)
+    open_timeout_margin_ms: Optional[int] = Field(default=None, ge=0, le=500)
+    probe_cooldown_default_ms: Optional[int] = Field(default=None, ge=500, le=60000)
+    probe_cooldown_min_ms: Optional[int] = Field(default=None, ge=500, le=30000)
+    probe_cooldown_max_ms: Optional[int] = Field(default=None, ge=500, le=60000)
+    sell_cooldown_default_ms: Optional[int] = Field(default=None, ge=1000, le=60000)
+    sell_proxy_reserve: Optional[int] = Field(default=None, ge=0, le=200)
+    clock_fallback_ms: Optional[int] = Field(default=None, ge=0, le=60000)
+    calibration_enabled: Optional[bool] = None
+
+
+class AdminSellOpenProbeCalibLogOut(BaseModel):
+    lines: List[str] = Field(default_factory=list)
+    early_429_alert: bool = False
+    calibration_enabled: bool = False
+
+
+class AdminSellOpenProbeCalibActionIn(BaseModel):
+    enabled: bool = Field(description="True=开启校准并启动；False=关闭并停止")
+    apply_suggested: bool = Field(
+        default=False,
+        description="开启时若已有建议可顺便写回 default（当前仅开关；建议值见日志）",
+    )

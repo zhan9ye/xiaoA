@@ -79,6 +79,7 @@ async def ensure_proxies_for_user(db: AsyncSession, user_id: int) -> List[Tuple[
                 WHERE id = (
                     SELECT id FROM proxy_pool_entries
                     WHERE assigned_user_id IS NULL AND is_active = 1 AND assignment_allowed = 1
+                      AND COALESCE(pool_role, 'sell') = 'sell'
                     ORDER BY id ASC LIMIT 1
                 )
                 """

@@ -71,6 +71,8 @@ class ProxyPoolEntry(Base):
     )
     # 自动购机入库时先为 False，经 akapi1 Login 探测通过后才可为 True；未通过前不得分配给平台用户。
     assignment_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
+    # sell=售卖共享池；probe=开门侦察池（与售卖隔离，可烧）
+    pool_role: Mapped[str] = mapped_column(String(16), default="sell")
 
 
 class RunnerLease(Base):
@@ -126,6 +128,8 @@ class PlatformSettings(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     sell_start_time: Mapped[str] = mapped_column(String(8), default="12:00")
+    # 开门探测 / 共享池 / 校准等 JSON，见 app.services.sell_open_probe_config
+    sell_open_probe_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
 class UserOperationLog(Base):

@@ -200,6 +200,20 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE proxy_pool_entries ADD COLUMN assignment_allowed INTEGER NOT NULL DEFAULT 1"
                 )
+            if "pool_role" not in pp_cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE proxy_pool_entries ADD COLUMN pool_role VARCHAR(16) NOT NULL DEFAULT 'sell'"
+                )
+
+            try:
+                ps_rows = (await conn.exec_driver_sql("PRAGMA table_info('platform_settings')")).fetchall()
+            except Exception:
+                ps_rows = []
+            ps_cols = {str(r[1]) for r in (ps_rows or [])}
+            if ps_rows and "sell_open_probe_json" not in ps_cols:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE platform_settings ADD COLUMN sell_open_probe_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
             try:
                 op_rows = (await conn.exec_driver_sql("PRAGMA table_info(user_operation_logs)")).fetchall()

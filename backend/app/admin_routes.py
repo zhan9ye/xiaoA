@@ -32,6 +32,10 @@ from app.schemas import (
     AdminProxyAutoPurchasePolicyOut,
     AdminPlatformSellStartIn,
     AdminPlatformSellStartOut,
+    AdminSellOpenProbeCalibActionIn,
+    AdminSellOpenProbeCalibLogOut,
+    AdminSellOpenProbeConfigIn,
+    AdminSellOpenProbeConfigOut,
     AdminCreateUserIn,
     AdminLoginIn,
     AdminProxyPoolAddIn,
@@ -64,8 +68,22 @@ from app.services.aliyun_ecs_ops import (
     run_instances_then_poll_public_ips_sync,
 )
 from app.services.proxy_akapi1_probe import probe_akapi1_login_via_proxy
-from app.platform_settings_repo import get_platform_sell_start_time, set_platform_sell_start_time
+from app.platform_settings_repo import (
+    get_platform_sell_start_time,
+    get_sell_open_probe_config,
+    set_platform_sell_start_time,
+    set_sell_open_probe_config,
+)
 from app.services.proxy_auto_purchase import get_auto_purchase_policy, set_auto_purchase_policy
+from app.services.sell_open_probe import (
+    clear_early_429_alert,
+    early_429_alert_active,
+    get_calibration_log_lines,
+    start_calibration_background,
+    stop_calibration_background,
+)
+from app.services.sell_open_probe_config import probe_config_to_dict
+from app.services.shared_proxy_runtime import get_shared_proxy_runtime, reload_shared_proxy_runtime_from_db
 from app.proxy_lifecycle_log import proxy_lifecycle_log
 from app.runner_lifecycle import (
     runner_execute_start_core,
@@ -242,6 +260,99 @@ async def admin_platform_sell_start_put(
     return AdminPlatformSellStartOut(sell_start_time=sell)
 
 
+def _normalize_pool_role(raw: Optional[str]) -> str:
+    s = (raw or "sell").strip().lower()
+    return s if s in ("sell", "probe") else "sell"
+
+
+@router.get("/sell-open-probe", response_model=AdminSellOpenProbeConfigOut)
+async def admin_sell_open_probe_get(
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminSellOpenProbeConfigOut:
+    cfg = await get_sell_open_probe_config(db)
+    try:
+        await reload_shared_proxy_runtime_from_db()
+        snap = await get_shared_proxy_runtime().snapshot()
+    except Exception:
+        snap = {}
+    d = probe_config_to_dict(cfg)
+    return AdminSellOpenProbeConfigOut(
+        **d,
+        early_429_alert=early_429_alert_active(),
+        pool_snapshot=snap,
+    )
+
+
+@router.put("/sell-open-probe", response_model=AdminSellOpenProbeConfigOut)
+async def admin_sell_open_probe_put(
+    body: AdminSellOpenProbeConfigIn,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminSellOpenProbeConfigOut:
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    # 允许显式清空 probe_user_id：传 0
+    if "probe_user_id" in body.model_dump(exclude_unset=True):
+        raw_uid = body.probe_user_id
+        patch["probe_user_id"] = None if raw_uid is None or int(raw_uid) <= 0 else int(raw_uid)
+    cfg = await set_sell_open_probe_config(db, patch, replace=False)
+    await db.commit()
+    await reload_shared_proxy_runtime_from_db()
+    snap = await get_shared_proxy_runtime().snapshot()
+    d = probe_config_to_dict(cfg)
+    return AdminSellOpenProbeConfigOut(
+        **d,
+        early_429_alert=early_429_alert_active(),
+        pool_snapshot=snap,
+    )
+
+
+@router.get("/sell-open-probe/calibration-log", response_model=AdminSellOpenProbeCalibLogOut)
+async def admin_sell_open_probe_calib_log(
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminSellOpenProbeCalibLogOut:
+    cfg = await get_sell_open_probe_config(db)
+    return AdminSellOpenProbeCalibLogOut(
+        lines=get_calibration_log_lines(limit),
+        early_429_alert=early_429_alert_active(),
+        calibration_enabled=bool(cfg.calibration_enabled),
+    )
+
+
+@router.post("/sell-open-probe/calibration", response_model=AdminSellOpenProbeCalibLogOut)
+async def admin_sell_open_probe_calib_toggle(
+    body: AdminSellOpenProbeCalibActionIn,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_admin),
+) -> AdminSellOpenProbeCalibLogOut:
+    cfg = await set_sell_open_probe_config(
+        db, {"calibration_enabled": bool(body.enabled)}, replace=False
+    )
+    await db.commit()
+    if body.enabled:
+        status = await start_calibration_background()
+    else:
+        status = await stop_calibration_background()
+        clear_early_429_alert()
+    lines = get_calibration_log_lines(200)
+    lines = [f"action={status}"] + lines
+    return AdminSellOpenProbeCalibLogOut(
+        lines=lines,
+        early_429_alert=early_429_alert_active(),
+        calibration_enabled=bool(cfg.calibration_enabled),
+    )
+
+
+@router.post("/sell-open-probe/clear-429-alert")
+async def admin_sell_open_probe_clear_429(
+    _auth: None = Depends(require_admin),
+):
+    clear_early_429_alert()
+    return {"ok": True}
+
+
 @router.get("/proxy-pool", response_model=AdminProxyPoolListOut)
 async def admin_proxy_pool_list(
     _auth: None = Depends(require_admin),
@@ -262,6 +373,7 @@ async def admin_proxy_pool_list(
                 label=e.label or "",
                 is_active=bool(e.is_active),
                 assignment_allowed=bool(getattr(e, "assignment_allowed", True)),
+                pool_role=_normalize_pool_role(getattr(e, "pool_role", None)),
                 assigned_user_id=e.assigned_user_id,
                 assigned_username=uname,
                 proxy_host_preview=_proxy_host_preview(e.proxy_url),
@@ -279,10 +391,19 @@ async def admin_proxy_pool_add(
     u = (body.proxy_url or "").strip()
     if not u:
         raise HTTPException(status_code=400, detail="proxy_url 不能为空")
-    row = ProxyPoolEntry(proxy_url=u, label=(body.label or "").strip()[:128], is_active=True)
+    row = ProxyPoolEntry(
+        proxy_url=u,
+        label=(body.label or "").strip()[:128],
+        is_active=True,
+        pool_role=_normalize_pool_role(getattr(body, "pool_role", None)),
+    )
     db.add(row)
     await db.commit()
     await db.refresh(row)
+    try:
+        await reload_shared_proxy_runtime_from_db()
+    except Exception:
+        pass
     return {"ok": True, "id": row.id}
 
 
@@ -313,9 +434,15 @@ async def admin_proxy_pool_patch(
         entry.proxy_url = nu
         if entry.assigned_user_id is not None:
             prev_uid = entry.assigned_user_id
+    if body.pool_role is not None:
+        entry.pool_role = _normalize_pool_role(body.pool_role)
     await db.commit()
     if prev_uid is not None:
         await invalidate_user_outbound_session(prev_uid)
+    try:
+        await reload_shared_proxy_runtime_from_db()
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -377,6 +504,10 @@ async def admin_proxy_pool_delete(
         await invalidate_user_outbound_session(prev_uid)
     await db.delete(entry)
     await db.commit()
+    try:
+        await reload_shared_proxy_runtime_from_db()
+    except Exception:
+        pass
     return AdminProxyPoolDeleteOut(ok=True, unbound_user_id=prev_uid)
 
 

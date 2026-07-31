@@ -58,16 +58,19 @@ async def post_ace_sell_son(
     v: str,
     lang: str = "cn",
     proxy_pin_index: Optional[int] = None,
+    proxy_url_override: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> Tuple[bool, int, Any, str]:
     """
     POST ACE_Sell_Son / ACE_Sell（application/x-www-form-urlencoded）。
     sonId 为空时走主账户接口 ACE_Sell；非空走子账户接口 ACE_Sell_Son。
     须在已 Login 的同一会话 client 上调用以携带 Cookie。
+
+    proxy_url_override：共享池借出的单条代理；用临时 client 携带 sm 的 Cookie 出站。
+    timeout_seconds：覆盖单次 POST 超时（开门探测用短超时；超时抛出由调用方捕获）。
     """
-    client = await sm.client()
-    pin_token = None
-    if proxy_pin_index is not None and sm.outbound_proxy_count() > 0:
-        pin_token = SessionManager.pinned_proxy_index(proxy_pin_index)
+    from app.services.session_manager import normalize_proxy_url
+
     son = str(son_id).strip()
     target_url = settings.ace_sell_main_url if not son else settings.ace_sell_son_url
     data = {
@@ -84,15 +87,36 @@ async def post_ace_sell_son(
         "v": str(v),
         "lang": str(lang),
     }
+
+    override = normalize_proxy_url(proxy_url_override)
+    if override:
+        return await _post_ace_via_override_proxy(
+            sm,
+            target_url=target_url,
+            data=data,
+            proxy_url=override,
+            timeout_seconds=timeout_seconds,
+        )
+
+    client = await sm.client()
+    pin_token = None
+    if proxy_pin_index is not None and sm.outbound_proxy_count() > 0:
+        pin_token = SessionManager.pinned_proxy_index(proxy_pin_index)
     try:
         try:
             if not sm.uses_multi_proxy_dispatch():
                 mark_outbound_request_start()
-            r = await client.post(
-                target_url,
-                headers=get_rpc_browser_headers(),
-                data=data,
-            )
+            post_kw: Dict[str, Any] = {
+                "headers": get_rpc_browser_headers(),
+                "data": data,
+            }
+            if timeout_seconds is not None:
+                post_kw["timeout"] = float(timeout_seconds)
+            r = await client.post(target_url, **post_kw)
+        except httpx.TimeoutException as e:
+            if not sm.uses_multi_proxy_dispatch():
+                clear_outbound_request_markers()
+            return False, 0, None, f"timeout:{e}"
         except httpx.RequestError as e:
             if not sm.uses_multi_proxy_dispatch():
                 try:
@@ -126,6 +150,63 @@ async def post_ace_sell_son(
     finally:
         if pin_token is not None:
             SessionManager.reset_pinned_proxy_index(pin_token)
+
+
+async def _post_ace_via_override_proxy(
+    sm: SessionManager,
+    *,
+    target_url: str,
+    data: Dict[str, Any],
+    proxy_url: str,
+    timeout_seconds: Optional[float],
+) -> Tuple[bool, int, Any, str]:
+    """共享池借出代理：临时 client + 复制会话 Cookie。"""
+    from app.services.session_manager import _outbound_verify_ca_bundle
+
+    base = await sm.client()
+    cookie_jar = httpx.Cookies()
+    try:
+        cookie_jar.update(base.cookies)
+    except Exception:
+        pass
+
+    verify_arg: Any = _outbound_verify_ca_bundle() if settings.outbound_tls_verify else False
+    to = float(timeout_seconds) if timeout_seconds is not None else float(settings.rpc_timeout_seconds or 30.0)
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy_url,
+            timeout=to,
+            follow_redirects=True,
+            verify=verify_arg,
+            trust_env=False,
+            cookies=cookie_jar,
+        ) as client:
+            try:
+                r = await client.post(
+                    target_url,
+                    headers=get_rpc_browser_headers(),
+                    data=data,
+                )
+            except httpx.TimeoutException as e:
+                return False, 0, None, f"timeout:{e}"
+            except httpx.RequestError as e:
+                return False, 0, None, str(e)
+            text = ""
+            parsed: Any = None
+            try:
+                parsed = r.json()
+                text = json.dumps(parsed, ensure_ascii=False, indent=2)
+            except ValueError:
+                text = r.text or ""
+            try:
+                base.cookies.update(client.cookies)
+            except Exception:
+                pass
+            return r.is_success, r.status_code, parsed, text
+    except httpx.TimeoutException as e:
+        return False, 0, None, f"timeout:{e}"
+    except Exception as e:
+        return False, 0, None, str(e)
 
 
 def describe_ace_sell_response(status_code: int, parsed: Any, raw_body: str) -> str:

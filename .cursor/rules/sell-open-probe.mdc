@@ -1,0 +1,38 @@
+---
+description: 开售探测相对基线超时与侦察/售卖分池约定（实现前必读设计文档）
+globs: backend/app/services/{runner,channel_closed,proxy_auto_purchase,proxy_akapi1_probe}.py,backend/app/proxy_binding.py,backend/app/platform_settings_repo.py
+alwaysApply: false
+---
+
+# 开售探测与代理池
+
+完整设计见 `docs/sell-open-probe.md`。实现或改相关逻辑时遵守：
+
+## 开门判据
+
+- 未开与当日关闭文案相同：`当前可售额度已达上限.本日交易通道已关闭`
+- 在 `[T_open, T_open+W]` 内：快返回该文案 = 未开；超时未完整返回或非该文案 = 已开
+- 窗外才可将该文案视为收工；探测窗内禁止当「当日结束」拉停全站
+
+## 相对基线超时
+
+- 配置：`default` / `min` / `max` / `margin`（默认超时建议 350ms）
+- 用未开快返回样本校准：`effective = clamp(baseline + margin, min, max)`
+- 样本不足用 default；历史可更新 default，但仍夹在 min～max
+- 超时即开门并 abort，不要等开售业务响应跑完
+
+## 管理端独立校准
+
+- 开门等待 RTT 与防 429 间隔均支持实测校准
+- 管理端手动开/关校准；结果打印到管理端（建议值 + 样本摘要）
+- 仅用侦察池；与正式开门探测/售卖高峰互斥为宜
+- 应用建议值时仍 clamp 到 min～max
+
+## 探测与售卖
+
+- 侦察池与售卖池隔离；探测可烧代理，优先密度（每轮 ≥2 代理并行）
+- 命中后 `sell_open_event` 唤醒已待命 Runner，禁止此时才 Login/拉子账号
+- **探测冷却与售卖冷却分离**：探测实测约 2～3s 可再访（不稳定），默认 ~3000ms，同样 `default/min/max` + 样本校准；售卖冷却仍默认 11s（529）
+- 售卖池：acquire → 请求 → release(sell_cooldown)；排队 FIFO
+- 池容量：⌈待售子账户/2⌉ + 预留
+- 探测侧提前 429 → 报警并上调有效冷却（夹在 max 内）

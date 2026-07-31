@@ -71,9 +71,8 @@ from app.services.proxy_auto_purchase import (
     auto_purchase_proxies_once,
     auto_release_proxy_servers_once,
     get_auto_purchase_policy,
-    seconds_until_next_auto_buy,
-    seconds_until_next_auto_release,
-    seconds_until_next_pre_sell_purchase,
+    seconds_until_next_pool_activate,
+    seconds_until_next_pool_release,
 )
 from app.services.subaccount_service import FetchSubaccountsOutcome, fetch_all_subaccounts
 from app.services.totp_util import totp_now_from_secret_ex
@@ -258,13 +257,14 @@ _proxy_pre_sell_purchase_task: Optional[asyncio.Task] = None
 _proxy_pre_sell_purchase_stop: Optional[asyncio.Event] = None
 _proxy_auto_release_task: Optional[asyncio.Task] = None
 _proxy_auto_release_stop: Optional[asyncio.Event] = None
+_sell_open_probe_task: Optional[asyncio.Task] = None
+_sell_open_probe_stop: Optional[asyncio.Event] = None
 
 
 async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
     """
-    每日北京时间定时自动购机（HH:MM 见 settings）：
-    - 若 PROXY_AUTO_PURCHASE_RUN_ON_STARTUP=true：进程启动当天若尚未跑过，会先执行一轮（便于部署后立即对齐池）
-    - 否则仅在每天到达设定时刻执行一次
+    代理池激活：每日全站开售前 N 分钟（默认 40）购机并探测。
+    若 PROXY_AUTO_PURCHASE_RUN_ON_STARTUP=true：进程启动当天若尚未跑过，会先执行一轮。
     """
     last_run_date = ""
     while not stop_event.is_set():
@@ -291,11 +291,17 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
                     error=repr(ex),
                 )
             last_run_date = today
-        wait_s = seconds_until_next_auto_buy()
+
+        async with AsyncSessionLocal() as db:
+            sell_hhmm = await get_platform_sell_start_time(db)
+        before = max(0, int(settings.proxy_pool_activate_minutes_before or 40))
+        wait_s = seconds_until_next_pool_activate(sell_hhmm, minutes_before=before)
         proxy_lifecycle_log(
             "scheduler",
-            action="purchase_wait",
+            action="pool_activate_wait",
             wait_seconds=f"{wait_s:.0f}",
+            sell_start_time=sell_hhmm,
+            minutes_before=before,
         )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
@@ -311,88 +317,66 @@ async def _proxy_auto_purchase_loop(stop_event: asyncio.Event) -> None:
         proxy_lifecycle_log(
             "scheduler",
             action="purchase_trigger",
-            trigger="daily-1130",
+            trigger="pool-activate",
             run_date=today2,
+            sell_start_time=sell_hhmm,
+            minutes_before=before,
         )
         try:
-            await auto_purchase_proxies_once(trigger="daily-1130")
+            await auto_purchase_proxies_once(trigger="pool-activate")
         except Exception as ex:
             proxy_lifecycle_log(
                 "scheduler",
                 action="purchase_failed",
-                trigger="daily-1130",
+                trigger="pool-activate",
                 error=repr(ex),
             )
         last_run_date = today2
 
 
-async def _proxy_pre_sell_purchase_loop(stop_event: asyncio.Event) -> None:
-    """每日全站开售北京时间前 10 分钟补购（含探测与批量 Login）。"""
+async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
+    """每日全站开售后 M 分钟（默认 10）自动释放代理服务器（跳过锁定实例）。"""
     last_run_date = ""
     while not stop_event.is_set():
         async with AsyncSessionLocal() as db:
             sell_hhmm = await get_platform_sell_start_time(db)
-        wait_s = seconds_until_next_pre_sell_purchase(sell_hhmm)
+        after = max(0, int(settings.proxy_pool_release_minutes_after or 10))
+        wait_s = seconds_until_next_pool_release(sell_hhmm, minutes_after=after)
         proxy_lifecycle_log(
             "scheduler",
-            action="pre_sell_purchase_wait",
+            action="pool_release_wait",
             wait_seconds=f"{wait_s:.0f}",
             sell_start_time=sell_hhmm,
+            minutes_after=after,
         )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
             break
         except asyncio.TimeoutError:
             pass
-        pol = await get_auto_purchase_policy()
-        if not pol["enabled"]:
+        if not bool(settings.proxy_auto_release_enabled):
             continue
         today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         if last_run_date == today:
             continue
         proxy_lifecycle_log(
             "scheduler",
-            action="purchase_trigger",
-            trigger="pre-sell-10m",
+            action="release_trigger",
+            trigger="pool-release",
             run_date=today,
             sell_start_time=sell_hhmm,
+            minutes_after=after,
         )
         try:
-            await auto_purchase_proxies_once(trigger="pre-sell-10m")
-        except Exception as ex:
-            proxy_lifecycle_log(
-                "scheduler",
-                action="purchase_failed",
-                trigger="pre-sell-10m",
-                error=repr(ex),
-            )
-        last_run_date = today
-
-
-async def _proxy_auto_release_loop(stop_event: asyncio.Event) -> None:
-    """每日北京时间 12:20 自动释放代理服务器（跳过锁定实例）。"""
-    while not stop_event.is_set():
-        wait_s = seconds_until_next_auto_release()
-        proxy_lifecycle_log(
-            "scheduler",
-            action="release_wait",
-            wait_seconds=f"{wait_s:.0f}",
-        )
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
-            break
-        except asyncio.TimeoutError:
-            pass
-        proxy_lifecycle_log("scheduler", action="release_trigger", trigger="daily-1220")
-        try:
-            await auto_release_proxy_servers_once(trigger="daily-1220")
+            await auto_release_proxy_servers_once(trigger="pool-release")
         except Exception as ex:
             proxy_lifecycle_log(
                 "scheduler",
                 action="release_failed",
-                trigger="daily-1220",
+                trigger="pool-release",
                 error=repr(ex),
             )
+        last_run_date = today
 
 
 @asynccontextmanager
@@ -400,6 +384,7 @@ async def lifespan(app: FastAPI):
     global _proxy_auto_purchase_task, _proxy_auto_purchase_stop
     global _proxy_pre_sell_purchase_task, _proxy_pre_sell_purchase_stop
     global _proxy_auto_release_task, _proxy_auto_release_stop
+    global _sell_open_probe_task, _sell_open_probe_stop
     await init_db()
     if settings.jwt_secret == "dev-change-me":
         print("WARNING: 使用默认 JWT_SECRET，公网部署请在 .env 设置强随机 jwt_secret")
@@ -413,16 +398,37 @@ async def lifespan(app: FastAPI):
         setup_proxy_lifecycle_file_logger()
         if proxy_lifecycle_log_file_ok():
             print("代理生命周期日志：已启用，见 request_log_dir / proxy_lifecycle.log")
+    try:
+        from app.services.shared_proxy_runtime import reload_shared_proxy_runtime_from_db
+
+        await reload_shared_proxy_runtime_from_db()
+    except Exception as ex:
+        print(f"WARNING: 共享代理池加载失败: {ex!r}")
     await _resume_runner_tasks()
     _proxy_auto_purchase_stop = asyncio.Event()
     _proxy_auto_purchase_task = asyncio.create_task(_proxy_auto_purchase_loop(_proxy_auto_purchase_stop))
-    _proxy_pre_sell_purchase_stop = asyncio.Event()
-    _proxy_pre_sell_purchase_task = asyncio.create_task(
-        _proxy_pre_sell_purchase_loop(_proxy_pre_sell_purchase_stop)
-    )
+    # 旧「开售前 10 分钟补购」已合并进开售前 40 分钟激活购机，不再单独起任务
+    _proxy_pre_sell_purchase_stop = None
+    _proxy_pre_sell_purchase_task = None
     _proxy_auto_release_stop = asyncio.Event()
     _proxy_auto_release_task = asyncio.create_task(_proxy_auto_release_loop(_proxy_auto_release_stop))
+    from app.services.sell_open_probe import sell_open_probe_scheduler_loop
+
+    _sell_open_probe_stop = asyncio.Event()
+    _sell_open_probe_task = asyncio.create_task(sell_open_probe_scheduler_loop(_sell_open_probe_stop))
     yield
+    if _sell_open_probe_stop is not None:
+        _sell_open_probe_stop.set()
+    if _sell_open_probe_task is not None:
+        _sell_open_probe_task.cancel()
+        try:
+            await _sell_open_probe_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        _sell_open_probe_task = None
+        _sell_open_probe_stop = None
     if _proxy_auto_purchase_stop is not None:
         _proxy_auto_purchase_stop.set()
     if _proxy_auto_purchase_task is not None:

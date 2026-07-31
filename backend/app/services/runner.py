@@ -23,6 +23,9 @@ from app.services.mnemonic_segments import derive_mnemonic_str1, split_mnemonic_
 from app.services.runner_fetch_guard import set_sub_fetch_allowed
 from app.services.runner_lease import get_runner_lease_holder_id, renew_runner_lease_if_holder, try_acquire_runner_lease
 from app.services.rpc_auth_signals import json_indicates_rpc_not_logged_in
+from app.services.sell_open_gate import reset_sell_open_for_today, signal_sell_open, wait_sell_open
+from app.services.shared_proxy_runtime import get_shared_proxy_runtime, reload_shared_proxy_runtime_from_db
+from app.platform_settings_repo import get_sell_open_probe_config
 from app.services.selling_eligibility import (
     ace_amount_string_for_rpc,
     ace_sell_rpc_son_id,
@@ -94,6 +97,44 @@ async def _wait_until_scheduled_first_sell_batch(
         ),
     )
     return await wait_interruptible_until_beijing(state.stop_event, first_at)
+
+
+async def _await_probe_or_clock_open(
+    state: AppState,
+    log_hub: LogHub,
+    sell_start_beijing: datetime,
+) -> None:
+    """
+    T_open 到达后：若开启开门探测，则等待 sell_open_event；超时则时钟兜底拉闸。
+    """
+    try:
+        from app.db import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            pcfg = await get_sell_open_probe_config(db)
+    except Exception:
+        pcfg = None
+    if pcfg is None or not pcfg.probe_enabled:
+        return
+    await reset_sell_open_for_today()
+    # 最长等待探测窗口；超时则时钟兜底
+    wait_s = max(float(pcfg.clock_fallback_ms) / 1000.0, float(pcfg.probe_window_seconds))
+    await log_hub.push(
+        LogLevel.info,
+        f"待命开门闸门：探测拉闸或最多等待 {wait_s:.0f}s 后时钟兜底",
+    )
+    opened = await wait_sell_open(timeout_seconds=wait_s, stop_event=state.stop_event)
+    if state.stop_event.is_set():
+        return
+    if opened:
+        await log_hub.push(LogLevel.success, "开门闸门已释放（探测命中），开始售卖")
+        return
+    first = await signal_sell_open("clock_fallback")
+    if first:
+        await log_hub.push(
+            LogLevel.warn,
+            f"探测未在 {wait_s:.0f}s 内命中，时钟兜底开火",
+        )
 
 
 def _clear_sell_mnemonic_cache(state: AppState) -> None:
@@ -782,6 +823,8 @@ async def _hot_slot_sell_loop(
     cfg_lock: asyncio.Lock,
     skip_day_ev: asyncio.Event,
     true_channel_closed_ev: asyncio.Event,
+    use_shared_sell_pool: bool = False,
+    sell_cooldown_ms: int = 11000,
 ) -> None:
     """
     单槽售卖：await 每次 ACE 结果后重试或换号。
@@ -792,10 +835,11 @@ async def _hot_slot_sell_loop(
 
     proxy_count = sm.outbound_proxy_count()
     pin_index: Optional[int] = None
-    if proxy_count > 1:
-        pin_index = proxy_index % proxy_count
-    elif proxy_count == 1:
-        pin_index = 0
+    if not use_shared_sell_pool:
+        if proxy_count > 1:
+            pin_index = proxy_index % proxy_count
+        elif proxy_count == 1:
+            pin_index = 0
 
     prep_max = max(1, int(settings.sell_prep_max_attempts or 8))
     grace_ms = max(0, int(settings.sell_channel_closed_grace_retry_ms or 0))
@@ -892,21 +936,39 @@ async def _hot_slot_sell_loop(
             continue
 
         v_ace = compute_js_timespan_v()
-        ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
-            sm,
-            amount=cnt,
-            password=cfg_row.password,
-            son_id=rpc_son_id,
-            mnemonic_id1=m_a,
-            mnemonic_key=m_b,
-            mnemonic_str1=m_c,
-            g_code=g,
-            count=cnt,
-            rpc_key=rk,
-            user_id=uid,
-            v=v_ace,
-            proxy_pin_index=pin_index,
-        )
+        proxy_override: Optional[str] = None
+        shared_lease = None
+        if use_shared_sell_pool:
+            rt = get_shared_proxy_runtime()
+            shared_lease = await rt.acquire("sell", stop_event=state.stop_event, wait=True)
+            if shared_lease is None:
+                await release_track()
+                return
+            proxy_override = shared_lease.proxy_url
+        try:
+            ok_s, code_s, parsed, raw_out = await post_ace_sell_son(
+                sm,
+                amount=cnt,
+                password=cfg_row.password,
+                son_id=rpc_son_id,
+                mnemonic_id1=m_a,
+                mnemonic_key=m_b,
+                mnemonic_str1=m_c,
+                g_code=g,
+                count=cnt,
+                rpc_key=rk,
+                user_id=uid,
+                v=v_ace,
+                proxy_pin_index=None if use_shared_sell_pool else pin_index,
+                proxy_url_override=proxy_override,
+            )
+        finally:
+            if shared_lease is not None:
+                await get_shared_proxy_runtime().release(
+                    shared_lease,
+                    cooldown_ms=sell_cooldown_ms,
+                    force_cooldown=True,
+                )
 
         if lease_holder:
             await renew_runner_lease_if_holder(user_id, lease_holder)
@@ -1054,14 +1116,32 @@ async def _hot_window_sell_session(
     lease_holder: Optional[str] = None,
 ) -> Tuple[bool, bool, bool]:
     """
-    HotWindow：代理数 × HOT_WINDOW_CONCURRENCY 个售卖槽；每槽 await 结果后重试/换号。
-    总槽位 = 实际绑定代理数 × HOT_WINDOW_CONCURRENCY（无代理时按 1 条出口计）。
+    HotWindow：默认「代理数 × HOT_WINDOW_CONCURRENCY」槽位；共享售卖池开启时按并发槽借还全局代理。
     返回 (channel_closed, relogin_recommended, skip_day_outbound)。
     """
     today = beijing_today_str()
     slots_per_proxy = max(1, int(settings.hot_window_concurrency or 1))
     proxy_count = max(1, sm.outbound_proxy_count())
-    total_slots = proxy_count * slots_per_proxy
+
+    use_shared = False
+    sell_cd = 11000
+    try:
+        from app.db import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            pcfg = await get_sell_open_probe_config(db)
+        use_shared = bool(pcfg.shared_sell_pool_enabled)
+        sell_cd = int(pcfg.sell_cooldown_default_ms)
+        if use_shared:
+            await reload_shared_proxy_runtime_from_db()
+    except Exception:
+        use_shared = False
+
+    if use_shared:
+        total_slots = max(1, slots_per_proxy)
+        proxy_count = 1
+    else:
+        total_slots = proxy_count * slots_per_proxy
 
     pending = _hot_window_pending_rows(items, cfg, today)
     if not pending:
@@ -1089,7 +1169,7 @@ async def _hot_window_sell_session(
             return False, True, False
 
     # 在「等到开售+grace」之前预热，避免 grace 结束后再打一轮 Mnemonic 把首单推迟数百毫秒
-    if rk0 and uid0 and sm.outbound_proxy_count() > 0:
+    if rk0 and uid0 and sm.outbound_proxy_count() > 0 and not use_shared:
         await _warmup_all_outbound_proxies(
             sm, log_hub, rk0, uid0, log_prefix="HotWindow 开售前"
         )
@@ -1100,13 +1180,22 @@ async def _hot_window_sell_session(
         ):
             return False, False, False
 
-    await log_hub.push(
-        LogLevel.info,
-        (
-            f"HotWindow 槽位网格：{proxy_count} 条出口 × {slots_per_proxy} 槽 = {total_slots} 路并发；"
-            f"待售 {len(pending)} 个"
-        ),
-    )
+    if use_shared:
+        await log_hub.push(
+            LogLevel.info,
+            (
+                f"HotWindow 共享售卖池：{total_slots} 路并发借还（冷却 {sell_cd}ms）；"
+                f"待售 {len(pending)} 个"
+            ),
+        )
+    else:
+        await log_hub.push(
+            LogLevel.info,
+            (
+                f"HotWindow 槽位网格：{proxy_count} 条出口 × {slots_per_proxy} 槽 = {total_slots} 路并发；"
+                f"待售 {len(pending)} 个"
+            ),
+        )
 
     busy_tracks: set = set()
     busy_lock = asyncio.Lock()
@@ -1115,9 +1204,9 @@ async def _hot_window_sell_session(
     true_channel_closed_ev = asyncio.Event()
 
     tasks: List[asyncio.Task] = []
-    for proxy_i in range(proxy_count):
-        for slot_i in range(slots_per_proxy):
-            label = f"代理{proxy_i + 1}-槽{slot_i + 1}"
+    if use_shared:
+        for slot_i in range(total_slots):
+            label = f"共享池-槽{slot_i + 1}"
             tasks.append(
                 asyncio.create_task(
                     _hot_slot_sell_loop(
@@ -1126,7 +1215,7 @@ async def _hot_window_sell_session(
                         log_hub,
                         sm,
                         items,
-                        proxy_index=proxy_i,
+                        proxy_index=0,
                         slot_label=label,
                         sell_start_beijing=sell_start_beijing,
                         lease_holder=lease_holder,
@@ -1135,9 +1224,35 @@ async def _hot_window_sell_session(
                         cfg_lock=cfg_lock,
                         skip_day_ev=skip_day_ev,
                         true_channel_closed_ev=true_channel_closed_ev,
+                        use_shared_sell_pool=True,
+                        sell_cooldown_ms=sell_cd,
                     )
                 )
             )
+    else:
+        for proxy_i in range(proxy_count):
+            for slot_i in range(slots_per_proxy):
+                label = f"代理{proxy_i + 1}-槽{slot_i + 1}"
+                tasks.append(
+                    asyncio.create_task(
+                        _hot_slot_sell_loop(
+                            user_id,
+                            state,
+                            log_hub,
+                            sm,
+                            items,
+                            proxy_index=proxy_i,
+                            slot_label=label,
+                            sell_start_beijing=sell_start_beijing,
+                            lease_holder=lease_holder,
+                            busy_tracks=busy_tracks,
+                            busy_lock=busy_lock,
+                            cfg_lock=cfg_lock,
+                            skip_day_ev=skip_day_ev,
+                            true_channel_closed_ev=true_channel_closed_ev,
+                        )
+                    )
+                )
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1322,6 +1437,7 @@ async def run_background(user_id: int, config: AppConfigIn) -> None:
                             if should_resync() or not open_ok:
                                 await log_hub.push(LogLevel.info, "全站开售时间已更新，按新时刻重新调度")
                                 continue
+                            await _await_probe_or_clock_open(state, log_hub, start_dt)
                         if state.stop_event.is_set():
                             break
                     else:

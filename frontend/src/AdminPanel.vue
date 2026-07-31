@@ -17,7 +17,6 @@ const actionMsg = ref("");
 const proxyEntries = ref([]);
 const poolErr = ref("");
 const poolLoading = ref(false);
-const proxyForm = ref({ label: "", proxy_url: "" });
 
 const createUserForm = ref({ username: "", password: "" });
 const createUserBusy = ref(false);
@@ -41,6 +40,34 @@ const proxyAutoPurchasePolicy = ref({
 const proxyAutoPurchaseBusy = ref(false);
 const platformSellStartTime = ref("12:00");
 const platformSellStartBusy = ref(false);
+
+const sellOpenProbe = ref({
+  probe_enabled: true,
+  shared_sell_pool_enabled: true,
+  probe_user_id: null,
+  probe_parallel: 2,
+  probe_round_gap_ms: 40,
+  probe_per_proxy_max_hits: 2,
+  probe_window_seconds: 120,
+  open_timeout_default_ms: 350,
+  open_timeout_min_ms: 250,
+  open_timeout_max_ms: 500,
+  open_timeout_margin_ms: 50,
+  probe_cooldown_default_ms: 3000,
+  probe_cooldown_min_ms: 2000,
+  probe_cooldown_max_ms: 5000,
+  sell_cooldown_default_ms: 11000,
+  sell_proxy_reserve: 4,
+  clock_fallback_ms: 2000,
+  calibration_enabled: false,
+  early_429_alert: false,
+  pool_snapshot: {},
+});
+const sellOpenProbeBusy = ref(false);
+const sellOpenProbeLogs = ref([]);
+const sellOpenProbeLogBusy = ref(false);
+
+const proxyForm = ref({ label: "", proxy_url: "", pool_role: "sell" });
 
 /** 阿里云 ECS：按启动模板创建（测试） */
 const ecsTestAmount = ref(1);
@@ -245,12 +272,127 @@ async function savePlatformSellStart() {
   }
 }
 
+async function loadSellOpenProbe() {
+  if (!token.value) return;
+  try {
+    const r = await fetch("/api/admin/sell-open-probe", { headers: headers() });
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) return;
+    const j = await r.json();
+    sellOpenProbe.value = { ...sellOpenProbe.value, ...j };
+  } catch {
+    /* ignore */
+  }
+}
+
+async function saveSellOpenProbe() {
+  actionMsg.value = "";
+  sellOpenProbeBusy.value = true;
+  try {
+    const p = sellOpenProbe.value;
+    const body = {
+      probe_enabled: Boolean(p.probe_enabled),
+      shared_sell_pool_enabled: Boolean(p.shared_sell_pool_enabled),
+      probe_user_id: p.probe_user_id == null || p.probe_user_id === "" ? 0 : Number(p.probe_user_id),
+      probe_parallel: Number(p.probe_parallel) || 2,
+      probe_round_gap_ms: Number(p.probe_round_gap_ms) || 40,
+      probe_per_proxy_max_hits: Number(p.probe_per_proxy_max_hits) || 2,
+      probe_window_seconds: Number(p.probe_window_seconds) || 120,
+      open_timeout_default_ms: Number(p.open_timeout_default_ms) || 350,
+      open_timeout_min_ms: Number(p.open_timeout_min_ms) || 250,
+      open_timeout_max_ms: Number(p.open_timeout_max_ms) || 500,
+      open_timeout_margin_ms: Number(p.open_timeout_margin_ms) || 50,
+      probe_cooldown_default_ms: Number(p.probe_cooldown_default_ms) || 3000,
+      probe_cooldown_min_ms: Number(p.probe_cooldown_min_ms) || 2000,
+      probe_cooldown_max_ms: Number(p.probe_cooldown_max_ms) || 5000,
+      sell_cooldown_default_ms: Number(p.sell_cooldown_default_ms) || 11000,
+      sell_proxy_reserve: Number(p.sell_proxy_reserve) || 0,
+      clock_fallback_ms: Number(p.clock_fallback_ms) || 2000,
+    };
+    const r = await fetch("/api/admin/sell-open-probe", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      adminLogout();
+      loginErr.value = "登录已过期，请重新登录";
+      return;
+    }
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "保存开门探测配置失败";
+      return;
+    }
+    sellOpenProbe.value = { ...sellOpenProbe.value, ...j };
+    actionMsg.value = "已保存开门探测 / 共享池配置";
+  } catch {
+    actionMsg.value = "网络错误";
+  } finally {
+    sellOpenProbeBusy.value = false;
+  }
+}
+
+async function refreshSellOpenProbeLogs() {
+  if (!token.value) return;
+  sellOpenProbeLogBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/sell-open-probe/calibration-log?limit=200", { headers: headers() });
+    if (!r.ok) return;
+    const j = await r.json();
+    sellOpenProbeLogs.value = Array.isArray(j.lines) ? j.lines : [];
+    sellOpenProbe.value.calibration_enabled = Boolean(j.calibration_enabled);
+    sellOpenProbe.value.early_429_alert = Boolean(j.early_429_alert);
+  } finally {
+    sellOpenProbeLogBusy.value = false;
+  }
+}
+
+async function toggleSellOpenCalibration(enabled) {
+  actionMsg.value = "";
+  sellOpenProbeLogBusy.value = true;
+  try {
+    const r = await fetch("/api/admin/sell-open-probe/calibration", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      actionMsg.value = typeof j.detail === "string" ? j.detail : "校准开关失败";
+      return;
+    }
+    sellOpenProbeLogs.value = Array.isArray(j.lines) ? j.lines : [];
+    sellOpenProbe.value.calibration_enabled = Boolean(j.calibration_enabled);
+    sellOpenProbe.value.early_429_alert = Boolean(j.early_429_alert);
+    actionMsg.value = enabled ? "已开启校准" : "已关闭校准";
+  } finally {
+    sellOpenProbeLogBusy.value = false;
+  }
+}
+
+async function clearSellOpen429Alert() {
+  await fetch("/api/admin/sell-open-probe/clear-429-alert", { method: "POST", headers: headers() });
+  sellOpenProbe.value.early_429_alert = false;
+  actionMsg.value = "已清除早 429 报警";
+}
+
+function onProbeUserChange(ev) {
+  const v = (ev?.target?.value || "").trim();
+  sellOpenProbe.value.probe_user_id = v ? Number(v) : null;
+}
+
 async function refreshAll() {
   await Promise.all([
     loadImpersonatePolicy(),
     loadMultiProxyPolicy(),
     loadPlatformSellStart(),
     loadProxyAutoPurchasePolicy(),
+    loadSellOpenProbe(),
     loadUsers(),
     loadProxyPool(),
     loadEcsList(),
@@ -569,7 +711,11 @@ async function submitProxyAdd() {
   const r = await fetch("/api/admin/proxy-pool", {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({ label: label || "未命名", proxy_url }),
+    body: JSON.stringify({
+      label: label || "未命名",
+      proxy_url,
+      pool_role: proxyForm.value.pool_role === "probe" ? "probe" : "sell",
+    }),
   });
   if (r.status === 401) {
     adminLogout();
@@ -580,7 +726,7 @@ async function submitProxyAdd() {
     actionMsg.value = typeof j.detail === "string" ? j.detail : "添加失败";
     return;
   }
-  proxyForm.value = { label: "", proxy_url: "" };
+  proxyForm.value = { label: "", proxy_url: "", pool_role: "sell" };
   actionMsg.value = `已添加代理池条目 #${j.id ?? ""}`;
   await loadProxyPool();
 }
@@ -1064,7 +1210,8 @@ onMounted(() => {
         <h2 class="mb-2 text-sm font-medium text-zinc-300">出站代理池</h2>
         <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
           <p class="mb-2 text-xs text-zinc-500">
-            全站开售时间（北京时间）：购机、Runner 定时开售与开售前禁开窗均读取此配置，热更新无需重启。
+            全站开售时间（北京时间）：购机/释放、Runner 开售与禁开窗均读取此配置。
+            代理池激活窗：开售前 40 分钟购机并检测，开售后 10 分钟自动释放。
           </p>
           <div class="flex flex-wrap items-center gap-3">
             <label class="inline-flex items-center gap-2 text-xs text-zinc-400">
@@ -1087,8 +1234,163 @@ onMounted(() => {
           </div>
         </div>
         <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+          <div class="mb-3 flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3 class="text-xs font-medium text-zinc-200">开门探测与共享售卖池</h3>
+              <p class="mt-1 text-[11px] leading-relaxed text-zinc-500">
+                侦察兵用探测账号打主账户售卖接口（无需选子账户），根据快返回/挂起判断开门；命中后唤醒待命 Runner。
+              </p>
+            </div>
+            <p
+              v-if="sellOpenProbe.early_429_alert"
+              class="shrink-0 rounded border border-amber-700/40 bg-amber-950/30 px-2 py-1 text-[11px] text-amber-300"
+            >
+              早 429 报警
+              <button type="button" class="ml-1 underline" @click="clearSellOpen429Alert">清除</button>
+            </p>
+          </div>
+
+          <div class="mb-3 grid gap-3 sm:grid-cols-2">
+            <div class="rounded-lg border border-zinc-800/80 bg-black/20 p-2.5">
+              <p class="mb-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500">开关</p>
+              <div class="flex flex-col gap-2 text-xs text-zinc-300">
+                <label class="inline-flex items-center gap-2">
+                  <input v-model="sellOpenProbe.probe_enabled" type="checkbox" class="h-4 w-4 rounded border-zinc-600" />
+                  开启开门探测
+                </label>
+                <label class="inline-flex items-center gap-2">
+                  <input v-model="sellOpenProbe.shared_sell_pool_enabled" type="checkbox" class="h-4 w-4 rounded border-zinc-600" />
+                  共享售卖池
+                </label>
+              </div>
+            </div>
+            <div class="rounded-lg border border-zinc-800/80 bg-black/20 p-2.5">
+              <p class="mb-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500">探测账号</p>
+              <label class="block text-[11px] text-zinc-500">
+                平台用户（须已保存交易配置：密码 / Google 密钥 / 助记词）
+                <select
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1.5 text-xs text-zinc-200"
+                  :value="sellOpenProbe.probe_user_id == null ? '' : String(sellOpenProbe.probe_user_id)"
+                  @change="onProbeUserChange"
+                >
+                  <option value="">（未选择）</option>
+                  <option v-for="u in users" :key="u.id" :value="String(u.id)">
+                    {{ u.username }} (#{{ u.id }})
+                  </option>
+                </select>
+              </label>
+              <p class="mt-1.5 text-[10px] leading-relaxed text-zinc-600">
+                探测走主账户 ACE_Sell（数量 1），不依赖子账户列表；建议用专用小号，避免开门瞬间真卖出额度。
+              </p>
+            </div>
+          </div>
+
+          <div class="mb-3 rounded-lg border border-zinc-800/80 bg-black/20 p-2.5">
+            <p class="mb-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500">参数</p>
+            <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+              <label class="text-[11px] text-zinc-500">
+                并行探测
+                <input
+                  v-model.number="sellOpenProbe.probe_parallel"
+                  type="number"
+                  min="1"
+                  max="8"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label class="text-[11px] text-zinc-500">
+                开门超时 ms
+                <input
+                  v-model.number="sellOpenProbe.open_timeout_default_ms"
+                  type="number"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label class="text-[11px] text-zinc-500">
+                探测冷却 ms
+                <input
+                  v-model.number="sellOpenProbe.probe_cooldown_default_ms"
+                  type="number"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label class="text-[11px] text-zinc-500">
+                售卖冷却 ms
+                <input
+                  v-model.number="sellOpenProbe.sell_cooldown_default_ms"
+                  type="number"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label class="text-[11px] text-zinc-500">
+                售卖预留台数
+                <input
+                  v-model.number="sellOpenProbe.sell_proxy_reserve"
+                  type="number"
+                  min="0"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label class="text-[11px] text-zinc-500">
+                探测窗口秒
+                <input
+                  v-model.number="sellOpenProbe.probe_window_seconds"
+                  type="number"
+                  min="10"
+                  class="mt-1 w-full rounded border border-zinc-700 bg-black/50 px-2 py-1 font-mono text-xs text-zinc-200"
+                />
+              </label>
+            </div>
+            <p class="mt-2 text-[10px] text-zinc-600">
+              池快照 · 售卖 ready/total
+              {{ sellOpenProbe.pool_snapshot?.sell_ready ?? "—" }}/{{ sellOpenProbe.pool_snapshot?.sell_total ?? "—" }}
+              · 侦察
+              {{ sellOpenProbe.pool_snapshot?.probe_ready ?? "—" }}/{{ sellOpenProbe.pool_snapshot?.probe_total ?? "—" }}
+            </p>
+          </div>
+
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              class="rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-1.5 text-xs text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
+              :disabled="sellOpenProbeBusy"
+              @click="saveSellOpenProbe"
+            >
+              {{ sellOpenProbeBusy ? "保存中…" : "保存配置" }}
+            </button>
+            <span class="mx-1 hidden h-4 w-px bg-zinc-700 sm:inline-block" />
+            <button
+              type="button"
+              class="rounded border border-zinc-600 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+              :disabled="sellOpenProbeLogBusy"
+              @click="refreshSellOpenProbeLogs"
+            >
+              刷新日志
+            </button>
+            <button
+              type="button"
+              class="rounded border border-emerald-700/50 bg-emerald-950/30 px-3 py-1.5 text-xs text-emerald-100 hover:bg-emerald-900/40 disabled:opacity-50"
+              :disabled="sellOpenProbeLogBusy || sellOpenProbe.calibration_enabled"
+              @click="toggleSellOpenCalibration(true)"
+            >
+              开启校准
+            </button>
+            <button
+              type="button"
+              class="rounded border border-amber-700/50 bg-amber-950/30 px-3 py-1.5 text-xs text-amber-100 hover:bg-amber-900/40 disabled:opacity-50"
+              :disabled="sellOpenProbeLogBusy || !sellOpenProbe.calibration_enabled"
+              @click="toggleSellOpenCalibration(false)"
+            >
+              关闭校准
+            </button>
+          </div>
+          <pre
+            class="max-h-40 overflow-auto rounded border border-zinc-800 bg-black/40 p-2 font-mono text-[10px] leading-relaxed text-zinc-400"
+          >{{ sellOpenProbeLogs.length ? sellOpenProbeLogs.join("\n") : "（暂无校准/探测日志）" }}</pre>
+        </div>
+        <div class="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
           <p class="mb-2 text-xs text-zinc-500">
-            自动购机策略（每日北京时间 11:30）：按「有效订阅且运行开启用户数 × 倍数」补足代理池。
+            自动购机：开售前 40 分钟激活购机（含探测）；共享池开启时按容量公式补售卖池。开售后 10 分钟自动释放。
           </p>
           <div class="flex flex-wrap items-center gap-3">
             <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
@@ -1140,6 +1442,13 @@ onMounted(() => {
               placeholder="http(s)://user:pass@host:port"
               class="min-w-[200px] flex-[2] rounded-lg border border-zinc-700 bg-black/50 px-3 py-1.5 font-mono text-xs outline-none ring-rose-500/40 focus:ring-2"
             />
+            <select
+              v-model="proxyForm.pool_role"
+              class="rounded-lg border border-zinc-700 bg-black/50 px-2 py-1.5 text-xs text-zinc-300"
+            >
+              <option value="sell">售卖池</option>
+              <option value="probe">侦察池</option>
+            </select>
             <button
               type="button"
               class="rounded-lg border border-rose-700/50 bg-rose-950/40 px-3 py-1.5 text-xs text-rose-200 hover:bg-rose-950/70"
@@ -1153,6 +1462,7 @@ onMounted(() => {
               <thead>
                 <tr class="border-b border-zinc-800 text-zinc-500">
                   <th class="px-2 py-2 font-medium">ID</th>
+                  <th class="px-2 py-2 font-medium">角色</th>
                   <th class="px-2 py-2 font-medium">标签</th>
                   <th class="px-2 py-2 font-medium">主机</th>
                   <th class="px-2 py-2 font-medium">绑定用户</th>
@@ -1164,6 +1474,11 @@ onMounted(() => {
               <tbody>
                 <tr v-for="p in proxyEntries" :key="p.id" class="border-b border-zinc-800/80 hover:bg-white/[0.02]">
                   <td class="px-2 py-2 font-mono text-zinc-400">{{ p.id }}</td>
+                  <td class="px-2 py-2">
+                    <span :class="p.pool_role === 'probe' ? 'text-amber-300' : 'text-zinc-400'">
+                      {{ p.pool_role === "probe" ? "侦察" : "售卖" }}
+                    </span>
+                  </td>
                   <td class="px-2 py-2">{{ p.label || "—" }}</td>
                   <td class="px-2 py-2 font-mono text-zinc-400">{{ p.proxy_host_preview || "—" }}</td>
                   <td class="px-2 py-2">

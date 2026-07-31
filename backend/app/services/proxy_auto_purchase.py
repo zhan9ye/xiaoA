@@ -186,7 +186,10 @@ async def batch_login_eligible_runner_users(trigger: str = "manual") -> Dict[str
     }
 
 
-async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
+async def _pool_inventory_snapshot(db: AsyncSession, *, role: str = "sell") -> Dict[str, int]:
+    role_n = (role or "sell").strip() or "sell"
+    role_filter = ProxyPoolEntry.pool_role == role_n
+    # 旧库无 pool_role 列时 SQLAlchemy 已迁移默认 sell
     assignable_pool = int(
         (
             await db.execute(
@@ -195,6 +198,7 @@ async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
                 .where(
                     ProxyPoolEntry.is_active.is_(True),
                     ProxyPoolEntry.assignment_allowed.is_(True),
+                    role_filter,
                 )
             )
         ).scalar_one()
@@ -209,6 +213,7 @@ async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
                     ProxyPoolEntry.is_active.is_(True),
                     ProxyPoolEntry.assignment_allowed.is_(True),
                     ProxyPoolEntry.assigned_user_id.is_(None),
+                    role_filter,
                 )
             )
         ).scalar_one()
@@ -219,7 +224,7 @@ async def _pool_inventory_snapshot(db: AsyncSession) -> Dict[str, int]:
             await db.execute(
                 select(func.count())
                 .select_from(ProxyPoolEntry)
-                .where(ProxyPoolEntry.is_active.is_(True))
+                .where(ProxyPoolEntry.is_active.is_(True), role_filter)
             )
         ).scalar_one()
         or 0
@@ -254,6 +259,7 @@ async def _insert_auto_purchase_pool_rows(
             label=iid[:128],
             is_active=True,
             assignment_allowed=False,
+            pool_role="sell",
         )
         db.add(row)
         await db.flush()
@@ -522,12 +528,23 @@ async def auto_purchase_proxies_once(trigger: str = "manual") -> Dict[str, Any]:
     pending: List[int] = []
 
     async with AsyncSessionLocal() as db:
+        from app.platform_settings_repo import get_sell_open_probe_config
+        import math
+
+        pcfg = await get_sell_open_probe_config(db)
         eligible_users_list = await _eligible_runner_users(db, now_utc)
         eligible_users = len(eligible_users_list)
-        pool_inv = await _pool_inventory_snapshot(db)
+        pool_inv = await _pool_inventory_snapshot(db, role="sell")
         assignable_pool = int(pool_inv["assignable_pool"])
 
-        target_total = eligible_users * multiplier
+        if pcfg.shared_sell_pool_enabled:
+            # ⌈待售子账户/2⌉ 暂以「合格用户×2」近似（每用户约两路出口）× 倍数冗余 + 预留
+            approx_subs = max(0, eligible_users) * 2
+            target_total = int(math.ceil(approx_subs / 2.0) * max(1, int(multiplier))) + int(
+                pcfg.sell_proxy_reserve or 0
+            )
+        else:
+            target_total = eligible_users * multiplier
         to_buy = max(0, target_total - assignable_pool)
         proxy_lifecycle_log(
             "purchase",
@@ -756,39 +773,77 @@ async def auto_release_proxy_servers_once(trigger: str = "daily-1220") -> Dict[s
 
 
 def seconds_until_next_auto_buy() -> float:
-    now = beijing_now()
-    hh = max(0, min(23, int(settings.proxy_auto_purchase_hour or 11)))
-    mm = max(0, min(59, int(settings.proxy_auto_purchase_minute or 30)))
-    target = dt.datetime(now.year, now.month, now.day, hh, mm, 0, tzinfo=BJ)
-    if now >= target:
-        target = target + dt.timedelta(days=1)
-    return max(1.0, (target - now).total_seconds())
+    """兼容旧调用：改为相对全站开售前 activate 分钟（需外部传入开售时刻时用 seconds_until_next_pool_activate）。"""
+    return 86400.0
 
 
 def seconds_until_next_auto_release() -> float:
-    now = beijing_now()
-    hh = max(0, min(23, int(settings.proxy_auto_release_hour or 12)))
-    mm = max(0, min(59, int(settings.proxy_auto_release_minute or 20)))
-    target = dt.datetime(now.year, now.month, now.day, hh, mm, 0, tzinfo=BJ)
-    if now >= target:
-        target = target + dt.timedelta(days=1)
-    return max(1.0, (target - now).total_seconds())
+    """兼容旧调用：请改用 seconds_until_next_pool_release(sell_hhmm)。"""
+    return 86400.0
 
 
-PRE_SELL_PURCHASE_MINUTES_BEFORE = 10
-
-
-def seconds_until_next_pre_sell_purchase(sell_hhmm: str, *, minutes_before: int = PRE_SELL_PURCHASE_MINUTES_BEFORE) -> float:
-    """距下一次「全站开售前 N 分钟」补购触发的秒数（北京时间）。"""
+def seconds_until_next_pool_activate(
+    sell_hhmm: str,
+    *,
+    minutes_before: Optional[int] = None,
+) -> float:
+    """
+    距下一次「代理池激活 / 购机+探测」的秒数。
+    触发点 = 全站开售 − minutes_before（默认 settings.proxy_pool_activate_minutes_before=40）。
+    若今日已过开售整点，则排到次日；若已进入今日激活窗但尚未开售，立即触发（返回 1）。
+    """
     p = parse_hhmm(sell_hhmm)
     if not p:
         return 86400.0
+    before = (
+        int(minutes_before)
+        if minutes_before is not None
+        else max(0, int(settings.proxy_pool_activate_minutes_before or 40))
+    )
     h, mi = p
     now = beijing_now()
     sell = dt.datetime(now.year, now.month, now.day, h, mi, 0, tzinfo=BJ)
-    trigger = sell - dt.timedelta(minutes=max(0, int(minutes_before)))
+    trigger = sell - dt.timedelta(minutes=before)
     if now >= sell:
         trigger = trigger + dt.timedelta(days=1)
-    elif now >= trigger:
+        return max(1.0, (trigger - now).total_seconds())
+    if now >= trigger:
         return 1.0
     return max(1.0, (trigger - now).total_seconds())
+
+
+def seconds_until_next_pool_release(
+    sell_hhmm: str,
+    *,
+    minutes_after: Optional[int] = None,
+) -> float:
+    """
+    距下一次「开售后自动释放代理」的秒数。
+    触发点 = 全站开售 + minutes_after（默认 10）。
+    """
+    p = parse_hhmm(sell_hhmm)
+    if not p:
+        return 86400.0
+    after = (
+        int(minutes_after)
+        if minutes_after is not None
+        else max(0, int(settings.proxy_pool_release_minutes_after or 10))
+    )
+    h, mi = p
+    now = beijing_now()
+    sell = dt.datetime(now.year, now.month, now.day, h, mi, 0, tzinfo=BJ)
+    trigger = sell + dt.timedelta(minutes=after)
+    if now >= trigger:
+        trigger = trigger + dt.timedelta(days=1)
+    return max(1.0, (trigger - now).total_seconds())
+
+
+# 兼容旧名
+PRE_SELL_PURCHASE_MINUTES_BEFORE = 40
+
+
+def seconds_until_next_pre_sell_purchase(
+    sell_hhmm: str, *, minutes_before: Optional[int] = None
+) -> float:
+    """兼容旧名：等同 seconds_until_next_pool_activate。"""
+    return seconds_until_next_pool_activate(sell_hhmm, minutes_before=minutes_before)

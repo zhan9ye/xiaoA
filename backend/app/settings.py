@@ -102,21 +102,25 @@ class Settings(BaseSettings):
     aliyun_region_id: str = ""
     aliyun_ecs_launch_template_id: str = ""
     aliyun_ecs_launch_template_version: str = ""
-    # 每日自动购机：北京时间 HH:MM（默认 11:30）按「有效订阅且 runner_enabled=true」用户数 * 倍数购机
+    # 自动购机总开关（管理端可覆盖）
     proxy_auto_purchase_enabled: bool = False
+    # 代理池激活窗：开售前 N 分钟购机+探测；开售后 M 分钟自动释放（相对全站开售时间）
+    proxy_pool_activate_minutes_before: int = 40  # PROXY_POOL_ACTIVATE_MINUTES_BEFORE
+    proxy_pool_release_minutes_after: int = 10  # PROXY_POOL_RELEASE_MINUTES_AFTER
+    # 以下 HH:MM 已弃用（保留兼容旧 .env）；调度改为相对开售时间
     proxy_auto_purchase_hour: int = 11
     proxy_auto_purchase_minute: int = 30
     proxy_auto_purchase_multiplier: int = 1
-    # 进程启动时是否立即跑一轮购机（false=仅在北京时间 PROXY_AUTO_PURCHASE_HOUR:MINUTE 执行）
+    # 进程启动时是否立即跑一轮购机（false=仅在开售前 activate 时刻执行）
     proxy_auto_purchase_run_on_startup: bool = False  # PROXY_AUTO_PURCHASE_RUN_ON_STARTUP
     # 自动购机入库后等待该秒数再探测；补购后也等待同样时间再探测
     proxy_auto_purchase_probe_delay_seconds: float = 120.0  # PROXY_AUTO_PURCHASE_PROBE_DELAY_SECONDS
     # 探测—释放—补购的最大轮数，超限则留有未放行条目并在日志告警
     proxy_auto_purchase_probe_max_rounds: int = 100  # PROXY_AUTO_PURCHASE_PROBE_MAX_ROUNDS
-    # 每日自动释放代理服务器（默认北京时间 12:20；会跳过已锁定实例）
+    # 每日自动释放代理服务器（会跳过已锁定实例）；时刻 = 开售 + release_minutes_after
     proxy_auto_release_enabled: bool = True
-    proxy_auto_release_hour: int = 12
-    proxy_auto_release_minute: int = 20
+    proxy_auto_release_hour: int = 12  # 弃用
+    proxy_auto_release_minute: int = 20  # 弃用
 
 
 settings = Settings()
